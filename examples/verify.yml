@@ -1,0 +1,75 @@
+# A workflow template, not an active workflow: GitHub runs only the files in .github/workflows/.
+# To use it, copy it to .github/workflows/verify.yml in a GitHub repository that holds this
+# action's code, such as a fork, and run it by hand (Actions, Verify, Run workflow).
+name: Verify
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published version tag to smoke-test, such as v1.0.0 (a version tag only; v1 is a branch)
+        required: true
+        default: v1.0.0
+
+permissions:
+  contents: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest -v
+
+  # The job the expiry guide tells readers to copy, as they copy it: the published @v1, no
+  # checkout, no permissions.
+  guide-example:
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - uses: hal-boring-utils/check-expiry-action@v1
+        with:
+          domains: |
+            example.com
+            www.example.com
+
+  # Real hosts through the published tag you name, the way a workflow installs it.
+  smoke:
+    needs: unit
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: hal-boring-utils/check-expiry-action
+          ref: refs/tags/${{ inputs.tag }}
+          path: published
+          persist-credentials: false
+      - id: healthy
+        uses: ./published
+        with:
+          domains: |
+            boringutils.com
+            www.boringutils.com
+          fail-on-warning: 'false'
+      # .invalid never resolves (RFC 6761), so this step must fail with "could not check".
+      - id: unreachable
+        continue-on-error: true
+        uses: ./published
+        with:
+          domains: unreachable.invalid
+      - name: Check the outcomes
+        env:
+          FAILURES: ${{ steps.healthy.outputs.failures }}
+          WARNINGS: ${{ steps.healthy.outputs.warnings }}
+          UNREACHABLE: ${{ steps.unreachable.outcome }}
+        run: |
+          echo "boringutils.com: failures=$FAILURES warnings=$WARNINGS; unreachable.invalid: $UNREACHABLE"
+          [[ "$FAILURES" == 0 && "$WARNINGS" =~ ^[0-9]+$ && "$UNREACHABLE" == failure ]]
