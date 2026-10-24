@@ -28,8 +28,13 @@ jobs:
           domains: |
             example.com
             www.example.com
+            example.co.uk
             api.example.co.uk
 ```
+
+List each registered domain itself, not only its subdomains: a registration is looked up under exactly the name you list (see [What it checks](#what-it-checks)).
+
+Every name you list also gets the TLS certificate check on port 443; there’s no registration-only option. A registered domain that doesn’t serve HTTPS therefore fails as “could not check”.
 
 `v1` is a release branch that only moves forward, to each 1.x release; its history is never rewritten. Each release also gets a version tag that never moves, starting with `v1.0.0`. To review every change before it runs, pin a version tag or a full commit SHA instead.
 
@@ -48,7 +53,7 @@ See [GitHub’s docs on scheduled events](https://docs.github.com/en/actions/ref
 For each domain:
 
 - **Certificate.** The action connects to port 443, sends the host name (SNI) and verifies the chain and the host name with Python’s `ssl.create_default_context()` and the runner’s trust store. Then it reads the certificate’s start and expiry dates. If verification fails, that’s a failure, with the reason: an expired certificate, a hostname mismatch, a self-signed certificate, or a chain it can’t complete (`unable to get local issuer certificate`). If it can’t connect at all, that’s a failure too, reported as “could not check” and never as “expired”.
-- **Domain registration.** It looks up the registration’s expiry date over RDAP at the registry for the domain’s TLD, found in IANA’s bootstrap file (`https://data.iana.org/rdap/dns.json`): the event whose `eventAction` is `expiration`. When the registry is down, doesn’t know the name, publishes no expiry date (`.nl` doesn’t, for example) or the TLD has no RDAP service, the registration shows as “Unknown” with the reason, and the run doesn’t fail for it. Each registered domain is looked up and counted once, however many of its hosts you list.
+- **Domain registration.** It asks the registry for the name’s TLD, found in IANA’s bootstrap file (`https://data.iana.org/rdap/dns.json`), about exactly the name you list, over RDAP, and reads the expiry date: the event whose `eventAction` is `expiration`. It uses an answer only when it is the registry’s domain record of that same name: its `objectClassName` is `domain`, and each name it gives (`ldhName`, `unicodeName`) is the name you listed. A subdomain such as `www.example.com` usually has no record of its own, so its registration shows as “Unknown” with a note to list its registered domain too: list `example.com` as well, and the `example.com` row has the date. When the registry is down, doesn’t know the name, answers about a different name, publishes no expiry date (`.nl` doesn’t, for example) or the TLD has no RDAP service, the registration shows as “Unknown” with the reason, and the run doesn’t fail for it. Each name is looked up and counted once, however you write it: as a URL, in capitals, with a final dot, or an international name in Unicode or in its `xn--` form.
 - **IP addresses** get the certificate check only.
 
 Results go to the run log and to the job summary, a table with a row for each host and a count of failures, warnings and unknown registration dates. Failures and warnings also appear as annotations; GitHub shows only a limited number of annotations per step, so the log and the summary are the full record.
@@ -61,20 +66,20 @@ Everything runs on the runner, which connects to:
 
 - each host you list, on port 443: a TLS handshake, and no page is requested
 - `data.iana.org`, once per run, for the bootstrap file (data that lists each TLD’s RDAP server)
-- each registry’s RDAP server, once per registered domain, and any address it redirects to
+- each registry’s RDAP server, once per domain name you list, and any address it redirects to
 
-Requests to IANA and the registries name the action in their user agent, `boringutils-expiry-action/1.0 (+https://boringutils.com/expiry-watch)`, so their operators can see what is asking. The registries see which registered domains you look up, as with any RDAP or WHOIS lookup.
+Requests to IANA and the registries name the action in their user agent, `boringutils-expiry-action/1.1 (+https://boringutils.com/expiry-watch)`, so their operators can see what is asking. Each name is looked up as itself, so the registries see every domain name you list, subdomains included.
 
 ## Inputs
 
 | Input | Default | Meaning |
 | --- | --- | --- |
-| `domains` | (required) | Domains or IP addresses, separated by newlines, commas or spaces. URLs work too; only the host name is used, and the check always uses port 443. Text after `#` is ignored. |
+| `domains` | (required) | Domains or IP addresses, separated by newlines, commas or spaces. URLs work too; only the host name is used, and the check always uses port 443. Text after `#` is ignored. A registration is looked up under exactly the name listed, so list a subdomain’s registered domain too to check that registration. Every name listed also gets the TLS certificate check. |
 | `cert-days` | `auto` | When a certificate warns. `auto` uses the lifetime rule below. A whole number warns when fewer than that many days are left; `0` never warns. An expired certificate always fails. |
 | `domain-days` | `30` | Warn when a registration expires in fewer than this many days. A whole number; `0` never warns. An expired registration always fails. |
 | `fail-on-warning` | `true` | `true` or `false`. With `false`, warnings are reported without failing the step. Failures always fail it. |
 
-An input the action can’t read, such as `cert-days: -5`, an entry in `domains` that isn’t a domain name or IP address, or `fail-on-warning: no`, fails the step with an error that names it, before anything is checked.
+An input the action can’t read, such as `cert-days: -5`, an entry in `domains` that isn’t a domain name or IP address, an international name it could read as two different domains (see [Limits](#limits)), or `fail-on-warning: no`, fails the step with an error that names it, before anything is checked.
 
 ## Outputs
 
@@ -83,7 +88,7 @@ An input the action can’t read, such as `cert-days: -5`, an entry in `domains`
 | `warnings` | Number of warnings. |
 | `failures` | Number of failures: an expired, untrusted or unreachable certificate, or an expired registration. |
 
-Each certificate counts once for each host, and each registered domain once.
+Each host counts once for its certificate and once for its registration.
 
 ## The lifetime rule (`cert-days: auto`)
 
@@ -96,7 +101,8 @@ Certificates valid for only a few days have hours left by this rule, so a daily 
 
 ## Limits
 
-- **The registered domain is an approximation.** The action doesn’t use the Public Suffix List. It looks a host’s registration up under its last two labels (`api.example.com` becomes `example.com`), or its last three when the last two are one of a short built-in list of two-part suffixes such as `co.uk`, `com.br` and `com.au`. Under any other suffix of two or more labels it asks about the wrong name: `shop.example.co.at` is looked up as `co.at`. The summary names the domain it looked up whenever that differs from the host, so check that it’s yours. If it isn’t, that row is about the other name: usually “Unknown”, but a registry that knows the other name gives its date, which can pass, warn or fail.
+- **Exact names only, on purpose.** Earlier releases guessed a host’s registered domain from its last two or three labels, and the guess could be someone else’s registration: `shop.example.co.at` was looked up as `co.at`, and any date the registry gave for `co.at` was reported on that row. The action now looks up exactly the name you list and uses only the registry’s record of that name, so it doesn’t report another registration’s date as yours. In exchange, a subdomain’s registration is “Unknown” unless you list its registered domain too, and the registries see each name you list.
+- **International names with ß, ς, or a zero-width joiner or non-joiner** go in their `xn--` form. IDNA 2008 encodes `faß.de` as `xn--fa-hia.de`, while the older IDNA 2003, which [Python’s built-in codec](https://docs.python.org/3/library/codecs.html#module-encodings.idna) follows, makes it `fass.de`: two different domains. Rather than check the wrong one, the action stops with an error that names the entry.
 - **One address.** The certificate check connects to whichever address the runner resolves. Behind a CDN or load balancer, other edges or nodes can serve a different certificate.
 - **Expired certificates.** When verification fails, the action reports the reason but not the dates, because Python only reads the dates of a certificate it verified.
 - **Port 443 only**, and the runner’s network: a host that is private or firewalled from GitHub’s runners shows as “could not check”.

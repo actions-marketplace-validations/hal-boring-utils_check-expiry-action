@@ -8,7 +8,7 @@ branding:
 inputs:
   domains:
     # Quoted: unquoted, YAML would read everything from " #" on as a comment.
-    description: "Domains or IP addresses to check, separated by newlines, commas or spaces. URLs work too; only the host name is used. Text after # is ignored. An entry that is not a domain name or IP address fails the step before anything is checked."
+    description: "Domains or IP addresses to check, separated by newlines, commas or spaces. URLs work too; only the host name is used. Text after # is ignored. A registration is looked up under exactly the name listed, so list a subdomain's registered domain too to check that registration. An entry that is not a domain name or IP address fails the step before anything is checked. Every name listed also gets the TLS certificate check on port 443."
     required: true
   cert-days:
     description: "When a certificate warns: 'auto', or a whole number of days, 0 or more. 'auto' warns certificates of 100 days or less when under an eighth of their lifetime is left, and longer ones under 30 days. A number warns under that many days left; 0 never warns, and an expired certificate still fails."
@@ -25,10 +25,10 @@ inputs:
 
 outputs:
   warnings:
-    description: Number of warnings. A registered domain shared by several hosts counts once.
+    description: Number of warnings. Each host's certificate and registration count once.
     value: ${{ steps.check.outputs.warnings }}
   failures:
-    description: Number of failures. A registered domain shared by several hosts counts once.
+    description: Number of failures. Each host's certificate and registration count once.
     value: ${{ steps.check.outputs.failures }}
 
 runs:

@@ -60,15 +60,60 @@ class Thresholds(unittest.TestCase):
         self.assertEqual(ce.domain_finding(NOW - timedelta(days=1), NOW, 0).level, ce.FAIL)
 
 
-class RegistrableDomain(unittest.TestCase):
-    def test_keeps_the_last_two_labels(self):
-        self.assertEqual(ce.registrable_domain("example.com"), "example.com")
-        self.assertEqual(ce.registrable_domain("a.b.example.com"), "example.com")
+class ExactName(unittest.TestCase):
+    """A registry answer counts only when it is the domain record of exactly the host looked up."""
 
-    def test_knows_common_two_part_suffixes(self):
-        self.assertEqual(ce.registrable_domain("www.example.co.uk"), "example.co.uk")
-        self.assertEqual(ce.registrable_domain("shop.example.com.br"), "example.com.br")
-        self.assertEqual(ce.registrable_domain("example.com.au"), "example.com.au")
+    def answer(self, **body: object) -> dict:
+        return {"objectClassName": "domain", **body}
+
+    def test_accepts_the_same_name_in_any_case_with_or_without_a_final_dot(self):
+        self.assertTrue(ce.rdap_is_for(self.answer(ldhName="EXAMPLE.COM"), "example.com"))
+        self.assertTrue(ce.rdap_is_for(self.answer(ldhName="example.co.at."), "example.co.at"))
+        self.assertTrue(ce.rdap_is_for(self.answer(ldhName=None, unicodeName="example.com"), "example.com"))
+
+    def test_refuses_a_parent_a_suffix_or_a_child(self):
+        self.assertFalse(ce.rdap_is_for(self.answer(ldhName="example.com"), "www.example.com"))
+        self.assertFalse(ce.rdap_is_for(self.answer(ldhName="co.at"), "example.co.at"))
+        self.assertFalse(ce.rdap_is_for(self.answer(ldhName="act.edu.au"), "example.act.edu.au"))
+        self.assertFalse(ce.rdap_is_for(self.answer(ldhName="www.example.com"), "example.com"))
+
+    def test_refuses_an_answer_that_is_not_a_domain_record_or_names_nothing(self):
+        self.assertFalse(ce.rdap_is_for({"objectClassName": "nameserver", "ldhName": "example.com"}, "example.com"))
+        self.assertFalse(ce.rdap_is_for({"ldhName": "example.com"}, "example.com"))
+        self.assertFalse(ce.rdap_is_for(self.answer(), "example.com"))
+        self.assertFalse(ce.rdap_is_for(self.answer(ldhName=None, unicodeName=None), "example.com"))
+        self.assertFalse(ce.rdap_is_for(self.answer(ldhName=["example.com"]), "example.com"))
+        self.assertFalse(ce.rdap_is_for(self.answer(ldhName=""), "example.com"))
+
+    def test_refuses_an_answer_whose_names_disagree(self):
+        # One name right and the other wrong: the record isn't clearly this host's.
+        self.assertFalse(ce.rdap_is_for(self.answer(ldhName="example.com", unicodeName="example.net"), "example.com"))
+        self.assertFalse(ce.rdap_is_for(self.answer(ldhName="example.net", unicodeName="example.com"), "example.com"))
+
+    def test_compares_international_names_in_their_xn_form(self):
+        host = ce.parse_domains("bücher.example")[0]
+        self.assertEqual(host, "xn--bcher-kva.example")
+        self.assertTrue(ce.rdap_is_for(self.answer(ldhName="XN--BCHER-KVA.EXAMPLE", unicodeName="bücher.example"), host))
+        self.assertTrue(ce.rdap_is_for(self.answer(unicodeName="Bücher.example"), host))
+        # The same name with ü as u and a combining diaeresis (NFD).
+        self.assertTrue(ce.rdap_is_for(self.answer(unicodeName="bu\N{COMBINING DIAERESIS}cher.example"), host))
+        self.assertFalse(ce.rdap_is_for(self.answer(unicodeName="bucher.example"), host))
+
+    def test_never_reads_a_sharp_s_as_ss(self):
+        # faß.example and fass.example are two registrations. IDNA 2003 would make them one.
+        self.assertEqual(ce.rdap_name("faß.example"), "xn--fa-hia.example")
+        record = self.answer(ldhName="xn--fa-hia.example", unicodeName="faß.example")
+        self.assertTrue(ce.rdap_is_for(record, "xn--fa-hia.example"))
+        self.assertFalse(ce.rdap_is_for(record, "fass.example"))
+        self.assertFalse(ce.rdap_is_for(self.answer(unicodeName="faß.example"), "fass.example"))
+
+    def test_refuses_a_name_longer_than_any_host(self):
+        # A host name is at most 253 characters, counted without the final dot. A longer name in
+        # an answer, in either form, can't be the host's.
+        longest = ".".join(["a" * 63] * 3 + ["a" * 61])
+        self.assertEqual(ce.rdap_name(longest + "."), longest)
+        self.assertIsNone(ce.rdap_name(".".join(["a" * 63] * 3 + ["a" * 62])))
+        self.assertIsNone(ce.rdap_name("ü" * 254))
 
 
 class ParseDomains(unittest.TestCase):
@@ -78,6 +123,15 @@ class ParseDomains(unittest.TestCase):
 
     def test_encodes_international_names(self):
         self.assertEqual(ce.parse_domains("bücher.de"), ["xn--bcher-kva.de"])
+        self.assertEqual(ce.parse_domains("Bücher.de xn--bcher-kva.de https://BÜCHER.DE/"), ["xn--bcher-kva.de"])
+
+    def test_leaves_names_idna_versions_disagree_on_as_typed_so_they_can_be_rejected(self):
+        # Encoded the IDNA 2003 way, faß.de would be checked as fass.de: another domain.
+        for name in ("faß.de", "shop.faß.de", "λας.example", "a\N{ZERO WIDTH JOINER}b.example", "a\N{ZERO WIDTH NON-JOINER}b.example"):
+            with self.subTest(name=name):
+                self.assertEqual(ce.parse_domains(name), [name])
+                self.assertIsNone(ce.host_kind(name))
+        self.assertEqual(ce.parse_domains("xn--fa-hia.de"), ["xn--fa-hia.de"])
 
     def test_reads_ip_addresses_with_or_without_brackets(self):
         text = "[2001:DB8::1]:443 https://[2001:db8::2]/status 192.0.2.1:8443"

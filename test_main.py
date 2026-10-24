@@ -2,7 +2,9 @@
 
 The network is mocked. Every host, certificate, registry answer and date here is SYNTHETIC, made up
 for these tests under reserved names (example.com and the .example and .test TLDs, RFC 2606; the
-192.0.2.0/24 documentation addresses, RFC 5737). Nothing is looked up for real.
+192.0.2.0/24 documentation addresses, RFC 5737), or under a real public suffix (co.at, co.uk,
+act.edu.au) where a test needs that suffix's shape. Each registry answer names the domain it is the
+record of, as real ones do. Nothing is looked up for real.
 Run from this folder: python3 -m unittest
 """
 
@@ -28,13 +30,25 @@ import check_expiry as ce
 NOW = datetime.now(timezone.utc)
 SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "check_expiry.py")
 
-# SYNTHETIC: a stand-in for IANA's bootstrap file with two made-up registries.
+# SYNTHETIC: a stand-in for IANA's bootstrap file with made-up registries.
 BOOTSTRAP = {
     "services": [
         [["com"], ["https://rdap.example.net/com/"]],
         [["example"], ["https://rdap.example.net/example/"]],
+        [["at"], ["https://rdap.example.net/at/"]],
+        [["uk"], ["https://rdap.example.net/uk/"]],
+        [["au"], ["https://rdap.example.net/au/"]],
     ]
 }
+# What a registration row adds when the registry has no record of exactly the name listed.
+LIST_REGISTERED = "if it's a subdomain, also list its registered domain (such as example.com for www.example.com) in 'domains'"
+NOT_FOUND = f"Unknown: not found in the registry under this exact name; {LIST_REGISTERED}"
+NOT_THIS_NAME = f"Unknown: the registry's answer is not a domain record for this exact name; {LIST_REGISTERED}"
+
+
+def rdap_url(name: str) -> str:
+    """The made-up registry URL for a domain, by its TLD."""
+    return f"https://rdap.example.net/{name.rsplit('.', 1)[-1]}/domain/{name}"
 
 
 def certificate(lifetime_days: float, left_days: float) -> dict:
@@ -44,10 +58,16 @@ def certificate(lifetime_days: float, left_days: float) -> dict:
     return {"notBefore": not_before.strftime("%b %d %H:%M:%S %Y GMT"), "notAfter": not_after.strftime("%b %d %H:%M:%S %Y GMT")}
 
 
-def registration(left_days: float) -> tuple[int, dict]:
-    """SYNTHETIC: a registry's RDAP answer for a domain that expires in this many days."""
+def expiring(left_days: float) -> list[dict]:
+    """SYNTHETIC: the RDAP events of a registration that expires in this many days."""
     expires = NOW + timedelta(days=left_days)
-    return 200, {"objectClassName": "domain", "events": [{"eventAction": "expiration", "eventDate": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}]}
+    return [{"eventAction": "expiration", "eventDate": expires.strftime("%Y-%m-%dT%H:%M:%SZ")}]
+
+
+def registration(name: str, left_days: float, **names: str) -> tuple[int, dict]:
+    """SYNTHETIC: a registry's RDAP record of the domain `name` (its ldhName), which expires in this
+    many days. `names` adds a unicodeName."""
+    return 200, {"objectClassName": "domain", "ldhName": name, **names, "events": expiring(left_days)}
 
 
 def verify_error(code: int, message: str) -> ssl.SSLCertVerificationError:
@@ -57,7 +77,7 @@ def verify_error(code: int, message: str) -> ssl.SSLCertVerificationError:
 
 
 HEALTHY = certificate(90, 60.5)
-EXAMPLE_COM = "https://rdap.example.net/com/domain/example.com"
+EXAMPLE_COM = rdap_url("example.com")
 
 
 class FakeNetwork:
@@ -170,7 +190,11 @@ def commands(log: str) -> list[str]:
 
 class HealthyRun(unittest.TestCase):
     def test_reports_every_host_and_passes(self):
-        fake = FakeNetwork({"example.com": HEALTHY, "www.example.com": HEALTHY}, {EXAMPLE_COM: registration(400.5)})
+        # The guide's example. The registry has no record of www.example.com, as with real registries.
+        fake = FakeNetwork(
+            {"example.com": HEALTHY, "www.example.com": HEALTHY},
+            {EXAMPLE_COM: registration("example.com", 400.5), rdap_url("www.example.com"): (404, {})},
+        )
         code, log, summary, outputs = run(fake, domains="example.com\nwww.example.com")
         self.assertEqual(code, 0)
         self.assertEqual(outputs, "warnings=0\nfailures=0\n")
@@ -179,17 +203,18 @@ class HealthyRun(unittest.TestCase):
         self.assertEqual(list(rows), ["example.com", "www.example.com"])
         self.assertTrue(rows["example.com"][0].startswith("OK: expires "), rows)
         self.assertIn("(60 days left), 90-day certificate, TLS 1.3", rows["example.com"][0])
-        self.assertTrue(rows["www.example.com"][1].startswith("OK: expires "), rows)
-        self.assertTrue(rows["www.example.com"][1].endswith("(`example.com`)"), rows)
-        self.assertIn("0 failures, 0 warnings, 0 registration dates unknown.", summary)
+        self.assertTrue(rows["example.com"][1].startswith("OK: expires "), rows)
+        self.assertTrue(rows["www.example.com"][0].startswith("OK: expires "), rows)
+        self.assertEqual(rows["www.example.com"][1], NOT_FOUND)
+        self.assertIn("0 failures, 0 warnings, 1 registration date unknown.", summary)
         self.assertEqual(fake.connections, [("example.com", 443), ("www.example.com", 443)])
-        # One bootstrap fetch per run, one lookup per registered domain.
-        self.assertEqual(fake.requests, [ce.BOOTSTRAP_URL, EXAMPLE_COM])
+        # One bootstrap fetch per run, one lookup per host, under its own name.
+        self.assertEqual(fake.requests, [ce.BOOTSTRAP_URL, EXAMPLE_COM, rdap_url("www.example.com")])
 
 
 class Warnings(unittest.TestCase):
     def test_fail_the_step_only_when_asked(self):
-        fake = FakeNetwork({"example.com": certificate(64, 5.5)}, {EXAMPLE_COM: registration(400.5)})
+        fake = FakeNetwork({"example.com": certificate(64, 5.5)}, {EXAMPLE_COM: registration("example.com", 400.5)})
         code, log, summary, outputs = run(fake, domains="example.com")
         self.assertEqual(code, 1)
         self.assertEqual(outputs, "warnings=1\nfailures=0\n")
@@ -201,33 +226,46 @@ class Warnings(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(outputs, "warnings=1\nfailures=0\n")
 
-    def test_a_registration_shared_by_several_hosts_counts_and_annotates_once(self):
-        hosts = ("example.com", "www.example.com", "api.example.com")
-        fake = FakeNetwork({host: HEALTHY for host in hosts}, {EXAMPLE_COM: registration(10.5)})
-        code, log, summary, outputs = run(fake, domains=", ".join(hosts))
+    def test_shared_input_counts_once_and_subdomains_never_borrow_a_registration(self):
+        # One domain written four ways and one international name written two ways, plus two
+        # subdomains of the first. Both registrations warn; the subdomains are unknown, not warned.
+        entries = "example.com, https://WWW.Example.com/login, EXAMPLE.COM., api.example.com\nbücher.example xn--bcher-kva.example http://example.com:8080/"
+        hosts = ("example.com", "www.example.com", "api.example.com", "xn--bcher-kva.example")
+        fake = FakeNetwork(
+            {host: HEALTHY for host in hosts},
+            {
+                EXAMPLE_COM: registration("example.com", 10.5),
+                rdap_url("www.example.com"): (404, {}),
+                rdap_url("api.example.com"): (404, {}),
+                rdap_url("xn--bcher-kva.example"): registration("xn--bcher-kva.example", 12.5, unicodeName="bücher.example"),
+            },
+        )
+        code, log, summary, outputs = run(fake, domains=entries)
         self.assertEqual(code, 1)
-        self.assertEqual(outputs, "warnings=1\nfailures=0\n")
-        self.assertEqual([line for line in commands(log) if line.startswith("::warning")], [commands(log)[0]])
-        self.assertTrue(commands(log)[0].startswith("::warning title=Domain example.com::expires "))
-        for host in hosts:
-            self.assertTrue(table(summary)[host][1].startswith("Warning: expires "), host)
-        self.assertEqual(fake.requests.count(EXAMPLE_COM), 1)
+        self.assertEqual(outputs, "warnings=2\nfailures=0\n")
+        warned = [line.split("::")[1] for line in commands(log)]
+        self.assertEqual(warned, ["warning title=Domain example.com", "warning title=Domain xn--bcher-kva.example"])
+        rows = table(summary)
+        self.assertEqual(list(rows), list(hosts))
+        self.assertTrue(rows["example.com"][1].startswith("Warning: expires "), rows)
+        self.assertTrue(rows["xn--bcher-kva.example"][1].startswith("Warning: expires "), rows)
+        self.assertEqual((rows["www.example.com"][1], rows["api.example.com"][1]), (NOT_FOUND, NOT_FOUND))
+        self.assertIn("0 failures, 2 warnings, 2 registration dates unknown.", summary)
+        self.assertEqual(fake.connections, [(host, 443) for host in hosts])
+        self.assertEqual(fake.requests, [ce.BOOTSTRAP_URL] + [rdap_url(host) for host in hosts])
 
 
 class NetworkFailures(unittest.TestCase):
     def test_a_certificate_that_cannot_be_checked_fails_and_is_never_called_expired(self):
-        fake = FakeNetwork(
-            {
-                "gone.example.com": socket.gaierror(-2, "Name or service not known"),
-                "slow.example.com": TimeoutError("timed out"),
-                "closed.example.com": ConnectionRefusedError(111, "Connection refused"),
-                "self.example.com": verify_error(19, "self-signed certificate in certificate chain"),
-                "old.example.com": verify_error(10, "certificate has expired"),
-            },
-            {EXAMPLE_COM: registration(400.5)},
-        )
-        hosts = "gone.example.com slow.example.com closed.example.com self.example.com old.example.com"
-        code, log, summary, outputs = run(fake, domains=hosts)
+        certs = {
+            "gone.example.com": socket.gaierror(-2, "Name or service not known"),
+            "slow.example.com": TimeoutError("timed out"),
+            "closed.example.com": ConnectionRefusedError(111, "Connection refused"),
+            "self.example.com": verify_error(19, "self-signed certificate in certificate chain"),
+            "old.example.com": verify_error(10, "certificate has expired"),
+        }
+        fake = FakeNetwork(certs, {rdap_url(host): (404, {}) for host in certs})
+        code, log, summary, outputs = run(fake, domains=" ".join(certs))
         self.assertEqual(code, 1)
         self.assertEqual(outputs, "warnings=0\nfailures=5\n")
         rows = table(summary)
@@ -240,15 +278,16 @@ class NetworkFailures(unittest.TestCase):
         self.assertEqual(len([line for line in commands(log) if line.startswith("::error title=Certificate ")]), 5)
 
     def test_registry_trouble_is_unknown_and_never_fails_the_run(self):
-        names = ("gone.example", "busy.example", "garbled.example", "quiet.example", "broken.example", "local.test")
+        names = ("gone.example", "refused.example", "busy.example", "garbled.example", "quiet.example", "broken.example", "local.test")
         fake = FakeNetwork(
             {name: HEALTHY for name in names},
             {
-                "https://rdap.example.net/example/domain/gone.example": (404, {}),
-                "https://rdap.example.net/example/domain/busy.example": (503, {}),
-                "https://rdap.example.net/example/domain/garbled.example": (200, b"<html>Service paused</html>"),
-                "https://rdap.example.net/example/domain/quiet.example": (200, {"objectClassName": "domain", "events": []}),
-                "https://rdap.example.net/example/domain/broken.example": http.client.IncompleteRead(b"{"),
+                rdap_url("gone.example"): (404, {}),
+                rdap_url("refused.example"): (400, {}),
+                rdap_url("busy.example"): (503, {}),
+                rdap_url("garbled.example"): (200, b"<html>Service paused</html>"),
+                rdap_url("quiet.example"): (200, {"objectClassName": "domain", "ldhName": "quiet.example", "events": []}),
+                rdap_url("broken.example"): http.client.IncompleteRead(b"{"),
             },
         )
         code, log, summary, outputs = run(fake, domains=" ".join(names))
@@ -259,7 +298,8 @@ class NetworkFailures(unittest.TestCase):
         self.assertEqual(
             registrations,
             {
-                "gone.example": "Unknown: not found in the registry",
+                "gone.example": NOT_FOUND,
+                "refused.example": f"Unknown: lookup failed: the registry answered HTTP 400; {LIST_REGISTERED}",
                 "busy.example": "Unknown: lookup failed: the registry answered HTTP 503",
                 "garbled.example": "Unknown: lookup failed: the registry's answer is not RDAP JSON",
                 "quiet.example": "Unknown: no expiry published by the registry",
@@ -267,7 +307,16 @@ class NetworkFailures(unittest.TestCase):
                 "local.test": "Unknown: no RDAP service for this TLD",
             },
         )
-        self.assertIn("0 failures, 0 warnings, 6 registration dates unknown.", summary)
+        self.assertIn("0 failures, 0 warnings, 7 registration dates unknown.", summary)
+
+    def test_a_rate_limit_is_unknown_without_advice_about_subdomains(self):
+        # 429 asks for fewer requests; it says nothing about whether the name is registered.
+        fake = FakeNetwork({"example.com": HEALTHY}, {EXAMPLE_COM: (429, {})})
+        code, log, summary, outputs = run(fake, domains="example.com")
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, "warnings=0\nfailures=0\n")
+        self.assertEqual(commands(log), [])
+        self.assertEqual(table(summary)["example.com"][1], "Unknown: lookup failed: the registry answered HTTP 429")
 
     def test_an_unreachable_bootstrap_file_is_fetched_once_and_reported(self):
         outage = urllib.error.URLError(TimeoutError("timed out"))
@@ -278,6 +327,116 @@ class NetworkFailures(unittest.TestCase):
         reason = "Unknown: not checked: IANA's RDAP bootstrap file is unavailable (timed out)"
         self.assertEqual([reg for _, reg in table(summary).values()], [reason, reason])
         self.assertEqual(fake.requests, [ce.BOOTSTRAP_URL])
+
+
+class ExactNames(unittest.TestCase):
+    """Each host's registration is looked up under exactly its own name, never a guessed parent,
+    and only the registry's record of that same name counts. Before, shop.example.co.at was
+    looked up as co.at and reported with co.at's date."""
+
+    def test_a_name_under_co_at_never_gets_the_date_of_co_at(self):
+        hosts = ("example.co.at", "shop.example.co.at")
+        fake = FakeNetwork(
+            {host: HEALTHY for host in hosts},
+            {
+                # The registry keeps a record of co.at itself, which expires soon. It isn't the user's.
+                rdap_url("co.at"): registration("co.at", 10.5),
+                rdap_url("example.co.at"): registration("example.co.at", 400.5),
+                rdap_url("shop.example.co.at"): (404, {}),
+            },
+        )
+        code, log, summary, outputs = run(fake, domains=" ".join(hosts))
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, "warnings=0\nfailures=0\n")
+        self.assertEqual(commands(log), [])
+        rows = table(summary)
+        self.assertTrue(rows["example.co.at"][1].startswith("OK: expires "), rows)
+        self.assertEqual(rows["shop.example.co.at"][1], NOT_FOUND)
+        self.assertEqual(fake.requests, [ce.BOOTSTRAP_URL] + [rdap_url(host) for host in hosts])
+
+    def test_com_and_co_uk_names_are_looked_up_as_listed(self):
+        hosts = ("example.com", "www.example.com", "example.co.uk", "www.example.co.uk")
+        fake = FakeNetwork(
+            {host: HEALTHY for host in hosts},
+            {
+                # Some registries write the name in upper case; it is still the same name.
+                EXAMPLE_COM: registration("EXAMPLE.COM", 400.5),
+                rdap_url("www.example.com"): (404, {}),
+                rdap_url("example.co.uk"): registration("example.co.uk", 10.5),
+                rdap_url("www.example.co.uk"): (404, {}),
+            },
+        )
+        code, log, summary, outputs = run(fake, domains=" ".join(hosts), fail_on_warning="false")
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, "warnings=1\nfailures=0\n")
+        self.assertEqual([line.split("::")[1] for line in commands(log)], ["warning title=Domain example.co.uk"])
+        rows = table(summary)
+        self.assertTrue(rows["example.com"][1].startswith("OK: expires "), rows)
+        self.assertTrue(rows["example.co.uk"][1].startswith("Warning: expires "), rows)
+        self.assertEqual((rows["www.example.com"][1], rows["www.example.co.uk"][1]), (NOT_FOUND, NOT_FOUND))
+        self.assertIn("0 failures, 1 warning, 2 registration dates unknown.", summary)
+        self.assertEqual(fake.requests, [ce.BOOTSTRAP_URL] + [rdap_url(host) for host in hosts])
+
+    def test_names_under_deeper_public_suffixes_are_looked_up_as_listed(self):
+        # act.edu.au is a public suffix of three labels: schools register names under it.
+        hosts = ("example.act.edu.au", "www.example.act.edu.au")
+        fake = FakeNetwork(
+            {host: HEALTHY for host in hosts},
+            {
+                rdap_url("act.edu.au"): registration("act.edu.au", 5.5),
+                rdap_url("example.act.edu.au"): registration("example.act.edu.au", 400.5),
+                rdap_url("www.example.act.edu.au"): (404, {}),
+            },
+        )
+        code, log, summary, outputs = run(fake, domains=" ".join(hosts))
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, "warnings=0\nfailures=0\n")
+        rows = table(summary)
+        self.assertTrue(rows["example.act.edu.au"][1].startswith("OK: expires "), rows)
+        self.assertEqual(rows["www.example.act.edu.au"][1], NOT_FOUND)
+        self.assertEqual(fake.requests, [ce.BOOTSTRAP_URL] + [rdap_url(host) for host in hosts])
+
+    def test_international_names_are_looked_up_in_their_xn_form(self):
+        fake = FakeNetwork(
+            {"xn--bcher-kva.example": HEALTHY, "shop.xn--bcher-kva.example": HEALTHY, "xn--caf-dma.example": HEALTHY},
+            {
+                rdap_url("xn--bcher-kva.example"): registration("XN--BCHER-KVA.EXAMPLE", 400.5, unicodeName="bücher.example"),
+                rdap_url("shop.xn--bcher-kva.example"): (404, {}),
+                # A registry that gives only the Unicode name.
+                rdap_url("xn--caf-dma.example"): (200, {"objectClassName": "domain", "unicodeName": "café.example", "events": expiring(400.5)}),
+            },
+        )
+        code, _, summary, outputs = run(fake, domains="BÜCHER.example shop.bücher.example café.example")
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, "warnings=0\nfailures=0\n")
+        rows = table(summary)
+        self.assertEqual(list(rows), ["xn--bcher-kva.example", "shop.xn--bcher-kva.example", "xn--caf-dma.example"])
+        self.assertTrue(rows["xn--bcher-kva.example"][1].startswith("OK: expires "), rows)
+        self.assertTrue(rows["xn--caf-dma.example"][1].startswith("OK: expires "), rows)
+        self.assertEqual(rows["shop.xn--bcher-kva.example"][1], NOT_FOUND)
+        self.assertEqual(fake.requests, [ce.BOOTSTRAP_URL] + [rdap_url(host) for host in rows])
+
+    def test_an_answer_for_another_name_or_no_name_is_unknown_and_never_warns(self):
+        # Every record here expires in 10.5 days and would warn if it were taken as the host's.
+        answers = {
+            # The registry answers with the record of a public suffix, or of the parent domain.
+            "shop.example.co.at": registration("co.at", 10.5),
+            "www.example.com": registration("example.com", 10.5),
+            # faß.example's record, which IDNA 2003 would read as fass.example.
+            "fass.example": registration("xn--fa-hia.example", 10.5, unicodeName="faß.example"),
+            # Not a domain record, or one that names no domain.
+            "ns.example": (200, {"objectClassName": "nameserver", "ldhName": "ns.example", "events": expiring(10.5)}),
+            "nameless.example": (200, {"objectClassName": "domain", "events": expiring(10.5)}),
+            "classless.example": (200, {"ldhName": "classless.example", "events": expiring(10.5)}),
+        }
+        fake = FakeNetwork({host: HEALTHY for host in answers}, {rdap_url(host): answer for host, answer in answers.items()})
+        code, log, summary, outputs = run(fake, domains=" ".join(answers))
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, "warnings=0\nfailures=0\n")
+        self.assertEqual(commands(log), [])
+        self.assertEqual({host: reg for host, (_, reg) in table(summary).items()}, {host: NOT_THIS_NAME for host in answers})
+        self.assertIn("0 failures, 0 warnings, 6 registration dates unknown.", summary)
+        self.assertEqual(fake.requests, [ce.BOOTSTRAP_URL] + [rdap_url(host) for host in answers])
 
 
 class IpAddresses(unittest.TestCase):
@@ -299,6 +458,8 @@ class InvalidInputs(unittest.TestCase):
             "fail-on-warning": {"domains": "example.com", "fail_on_warning": "no"},
             "'domains' has entries that are not domain names": {"domains": "example.com\n*.example.com"},
             "No domains given": {"domains": "# all commented out"},
+            # Checked as fass.example, it would report another domain's certificate and registration.
+            "two different domains: faß.example, λας.example. List each in its xn-- form.": {"domains": "example.com faß.example λας.example"},
         }
         for named, inputs in cases.items():
             with self.subTest(named):

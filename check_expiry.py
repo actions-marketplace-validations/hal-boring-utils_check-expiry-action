@@ -26,13 +26,14 @@ import re
 import socket
 import ssl
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-USER_AGENT = "boringutils-expiry-action/1.0 (+https://boringutils.com/expiry-watch)"
+USER_AGENT = "boringutils-expiry-action/1.1 (+https://boringutils.com/expiry-watch)"
 BOOTSTRAP_URL = "https://data.iana.org/rdap/dns.json"
 CONNECT_TIMEOUT = 10
 RDAP_TIMEOUT = 15
@@ -43,22 +44,15 @@ DAY = 86400.0
 SHORT_LIVED_DAYS = 100
 LONG_LIVED_WARN_DAYS = 30
 
-# Common two-part public suffixes. Not the full Public Suffix List: anything else falls back
-# to the last two labels.
-TWO_PART_SUFFIXES = frozenset(
-    """
-    co.uk org.uk me.uk ltd.uk plc.uk net.uk ac.uk gov.uk sch.uk nhs.uk
-    com.au net.au org.au edu.au gov.au id.au asn.au
-    com.br net.br org.br gov.br edu.br art.br
-    co.nz net.nz org.nz govt.nz ac.nz
-    co.za org.za net.za gov.za ac.za
-    co.jp ne.jp or.jp ac.jp go.jp
-    co.in net.in org.in firm.in gen.in ind.in
-    com.mx org.mx gob.mx net.mx
-    com.ar com.co com.tr com.cn net.cn org.cn com.hk com.sg com.my com.ph com.tw com.ua com.pl
-    co.kr or.kr co.il org.il co.id or.id ac.id co.th in.th
-    """.split()
+# Characters Python's "idna" codec (IDNA 2003) maps away but IDNA 2008 and browsers keep: ß, final
+# sigma, zero-width non-joiner and joiner. faß.de is fass.de to one and xn--fa-hia.de to the other,
+# two different registrations.
+IDNA_DEVIATIONS = frozenset(
+    "\N{LATIN SMALL LETTER SHARP S}\N{GREEK SMALL LETTER FINAL SIGMA}\N{ZERO WIDTH NON-JOINER}\N{ZERO WIDTH JOINER}"
 )
+# The registry has no record of exactly this name. Names are never guessed up to a parent, so a
+# listed subdomain usually ends here.
+LIST_REGISTERED = "if it's a subdomain, also list its registered domain (such as example.com for www.example.com) in 'domains'"
 
 # A host name label: letters, digits, hyphens and underscores, 1 to 63 long, no hyphen at either end.
 HOST_LABEL = re.compile(r"[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?")
@@ -95,8 +89,9 @@ class Settings:
 
 def parse_domains(text: str) -> list[str]:
     """Splits on newlines, commas and spaces; skips # comments; strips schemes, paths, ports and
-    IPv6 brackets; lowercases; dedupes. An entry with no host in it stays as typed, so the input
-    check can name it rather than drop it."""
+    IPv6 brackets; lowercases; writes international names in their xn-- form; dedupes. An entry
+    with no host in it, or with a character IDNA versions encode differently, stays as typed, so
+    the input check can name it rather than drop it or check another domain."""
     seen: list[str] = []
     words = [word for line in text.splitlines() for word in line.split("#", 1)[0].replace(",", " ").split()]
     for host in words:
@@ -113,7 +108,7 @@ def parse_domains(text: str) -> list[str]:
             elif host.count(":") == 1:
                 host = host.split(":", 1)[0]
         host = host.strip(".").lower()
-        if host:
+        if host and not IDNA_DEVIATIONS.intersection(host):
             try:
                 host = host.encode("idna").decode("ascii")
             except UnicodeError:
@@ -136,15 +131,6 @@ def host_kind(host: str) -> str | None:
     if len(host) <= 253 and not labels[-1].isdigit() and all(HOST_LABEL.fullmatch(label) for label in labels):
         return "name"
     return None
-
-
-def registrable_domain(host: str) -> str:
-    """www.example.co.uk -> example.co.uk; api.example.com -> example.com (simple suffix rule)."""
-    labels = host.split(".")
-    if len(labels) <= 2:
-        return host
-    keep = 3 if ".".join(labels[-2:]) in TWO_PART_SUFFIXES else 2
-    return ".".join(labels[-keep:])
 
 
 def whole_days(text: str) -> int:
@@ -201,6 +187,33 @@ def rdap_expiration(body: object) -> datetime | None:
         if isinstance(event, dict) and str(event.get("eventAction", "")).lower() == "expiration":
             return parse_rdap_date(event.get("eventDate", ""))
     return None
+
+
+def rdap_name(value: object) -> str | None:
+    """An RDAP ldhName or unicodeName written the way hosts are: lowercase, no final dot, each
+    international label in its xn-- form. Labels are encoded as given, without IDNA 2003's mapping
+    (which reads faß as fass), so only the same name compares equal."""
+    if not isinstance(value, str):
+        return None
+    name = unicodedata.normalize("NFC", value.strip()).lower()
+    if name.endswith("."):
+        name = name[:-1]
+    # A host name is at most 253 characters, and its Unicode form is never longer than its xn--
+    # form, so a longer name can't be the host. Measured before encoding: punycode's time grows
+    # with the square of a label's length, and an answer can be a megabyte.
+    if len(name) > 253:
+        return None
+    return ".".join(label if label.isascii() else "xn--" + label.encode("punycode").decode("ascii") for label in name.split("."))
+
+
+def rdap_is_for(body: dict, host: str) -> bool:
+    """Whether an RDAP answer is the domain record of exactly this host: objectClassName "domain",
+    and every name it gives (ldhName, unicodeName) is the host. A record of anything else, such as
+    a parent or a public suffix, holds another registration's dates."""
+    if body.get("objectClassName") != "domain":
+        return False
+    names = [body[key] for key in ("ldhName", "unicodeName") if body.get(key) is not None]
+    return bool(names) and all(rdap_name(name) == host for name in names)
 
 
 def rdap_server(bootstrap: object, domain: str) -> str | None:
@@ -329,45 +342,44 @@ def load_bootstrap() -> tuple[object, str]:
 
 
 class Registry:
-    """Registration lookups for one run. IANA's bootstrap file is fetched at most once, and each
-    registered domain is looked up once, however many of its hosts are listed."""
+    """Registration lookups for one run. IANA's bootstrap file is fetched at most once. Each host
+    is looked up under its own name and nothing else: guessing which part of a name was registered
+    can land on another registration and report its dates as the host's."""
 
     def __init__(self, now: datetime, warn_days: int) -> None:
         self.now = now
         self.warn_days = warn_days
         self.bootstrap: tuple[object, str] | None = None
-        self.found: dict[str, Finding] = {}
 
-    def check(self, host: str) -> tuple[str, Finding]:
-        """The name looked up for a host, and what its registry says about it."""
+    def check(self, host: str) -> Finding:
+        """What the registry says about exactly this host."""
         if host_kind(host) == "ip":
-            return host, Finding(SKIP, "an IP address has no domain registration")
-        domain = registrable_domain(host)
-        if domain not in self.found:
-            self.found[domain] = self.lookup(domain)
-        return domain, self.found[domain]
-
-    def lookup(self, domain: str) -> Finding:
+            return Finding(SKIP, "an IP address has no domain registration")
         if self.bootstrap is None:
             self.bootstrap = load_bootstrap()
         bootstrap, problem = self.bootstrap
         if problem:
             return Finding(UNKNOWN, f"not checked: {problem}")
-        base = rdap_server(bootstrap, domain)
+        base = rdap_server(bootstrap, host)
         if base is None:
             return Finding(UNKNOWN, "no RDAP service for this TLD")
         try:
-            status, body = fetch_json(urllib.parse.urljoin(base, "domain/" + urllib.parse.quote(domain)))
+            status, body = fetch_json(urllib.parse.urljoin(base, "domain/" + urllib.parse.quote(host)))
         except LOOKUP_ERRORS as error:
             return Finding(UNKNOWN, f"lookup failed: {lookup_reason(error)}")
-        # Not found is unknown, not a warning: the name looked up can be the wrong level (see
-        # registrable_domain), and a host whose domain really is gone fails its certificate check.
+        # Not found is unknown, not a warning: a listed subdomain usually isn't a registration of its
+        # own, and a host whose domain really is gone fails its certificate check.
         if status == 404:
-            return Finding(UNKNOWN, "not found in the registry")
+            return Finding(UNKNOWN, f"not found in the registry under this exact name; {LIST_REGISTERED}")
+        # A rate limit (429) says nothing about the name, so it gets no advice about subdomains.
+        if 400 <= status < 500 and status != 429:
+            return Finding(UNKNOWN, f"lookup failed: the registry answered HTTP {status}; {LIST_REGISTERED}")
         if status != 200:
             return Finding(UNKNOWN, f"lookup failed: the registry answered HTTP {status}")
         if not isinstance(body, dict):
             return Finding(UNKNOWN, "lookup failed: the registry's answer is not RDAP JSON")
+        if not rdap_is_for(body, host):
+            return Finding(UNKNOWN, f"the registry's answer is not a domain record for this exact name; {LIST_REGISTERED}")
         return domain_finding(rdap_expiration(body), self.now, self.warn_days)
 
 
@@ -420,9 +432,16 @@ def read_settings() -> tuple[Settings, list[str]]:
     errors: list[str] = []
     domains = parse_domains(os.environ.get("INPUT_DOMAINS", ""))
     invalid = [host for host in domains if host_kind(host) is None]
-    if invalid:
-        errors.append(f"'domains' has entries that are not domain names or IP addresses: {', '.join(invalid)}")
-    elif not domains:
+    ambiguous = [host for host in invalid if IDNA_DEVIATIONS.intersection(host)]
+    unreadable = [host for host in invalid if host not in ambiguous]
+    if unreadable:
+        errors.append(f"'domains' has entries that are not domain names or IP addresses: {', '.join(unreadable)}")
+    if ambiguous:
+        errors.append(
+            f"'domains' has international names with ß, ς or a zero-width joiner or non-joiner, which tools convert to "
+            f"two different domains: {', '.join(ambiguous)}. List each in its xn-- form."
+        )
+    if not domains:
         errors.append("No domains given. Set the 'domains' input.")
     cert_setting = os.environ.get("INPUT_CERT_DAYS", "").strip().lower() or "auto"
     try:
@@ -450,22 +469,20 @@ def main() -> int:
 
     now = datetime.now(timezone.utc)
     registry = Registry(now, settings.domain_days)
-    rows: list[tuple[str, Finding, str, Finding]] = []
+    rows: list[tuple[str, Finding, Finding]] = []
     for host in settings.domains:
         cert = check_certificate(host, now, settings.cert_setting)
-        registered, registration = registry.check(host)
-        first = all(registered != row[2] for row in rows)
-        rows.append((host, cert, registered, registration))
+        registration = registry.check(host)
+        rows.append((host, cert, registration))
         print(host)
         print(f"  certificate: {ICON[cert.level]}: {cert.summary}")
-        print(f"  domain {registered}: {ICON[registration.level]}: {registration.summary}")
+        print(f"  registration: {ICON[registration.level]}: {registration.summary}")
         annotate(cert.level, f"Certificate {host}", cert.summary)
-        if first:
-            annotate(registration.level, f"Domain {registered}", registration.summary)
+        annotate(registration.level, f"Domain {host}", registration.summary)
 
-    # Each certificate counts once per host, each registered domain once however many hosts share it.
-    registrations = {registered: reg for _, _, registered, reg in rows}
-    findings = [cert for _, cert, _, _ in rows] + list(registrations.values())
+    # Hosts are deduplicated and each registration is looked up under its host's own name, so each
+    # host counts once for its certificate and once for its registration.
+    findings = [finding for _, cert, reg in rows for finding in (cert, reg)]
     failures = sum(f.level == FAIL for f in findings)
     warnings = sum(f.level == WARN for f in findings)
     unknown = sum(f.level == UNKNOWN for f in findings)
@@ -480,9 +497,8 @@ def main() -> int:
         "| Domain | Certificate | Registration |",
         "| --- | --- | --- |",
     ]
-    for host, cert, registered, reg in rows:
-        looked_up = "" if registered == host else f" (`{registered}`)"
-        lines.append(f"| `{host}` | {ICON[cert.level]}: {cell(cert.summary)} | {ICON[reg.level]}: {cell(reg.summary)}{looked_up} |")
+    for host, cert, reg in rows:
+        lines.append(f"| `{host}` | {ICON[cert.level]}: {cell(cert.summary)} | {ICON[reg.level]}: {cell(reg.summary)} |")
     lines += [
         "",
         f"{tally(failures, warnings, unknown)} Certificate rule: {cert_rule}; domain rule: {settings.domain_days} days.",
