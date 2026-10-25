@@ -362,7 +362,7 @@ class Registry:
             return Finding(UNKNOWN, f"not checked: {problem}")
         base = rdap_server(bootstrap, host)
         if base is None:
-            return Finding(UNKNOWN, "no RDAP service for this TLD")
+            return Finding(UNKNOWN, "registration lookup unavailable for this ending")
         try:
             status, body = fetch_json(urllib.parse.urljoin(base, "domain/" + urllib.parse.quote(host)))
         except LOOKUP_ERRORS as error:

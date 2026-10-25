@@ -304,7 +304,7 @@ class NetworkFailures(unittest.TestCase):
                 "garbled.example": "Unknown: lookup failed: the registry's answer is not RDAP JSON",
                 "quiet.example": "Unknown: no expiry published by the registry",
                 "broken.example": "Unknown: lookup failed: IncompleteRead(1 bytes read)",
-                "local.test": "Unknown: no RDAP service for this TLD",
+                "local.test": "Unknown: registration lookup unavailable for this ending",
             },
         )
         self.assertIn("0 failures, 0 warnings, 7 registration dates unknown.", summary)
