@@ -198,6 +198,71 @@ class Rdap(unittest.TestCase):
         self.assertIsNone(ce.parse_rdap_date("9999-12-31T23:30:00-01:00"))
         self.assertIsNone(ce.parse_rdap_date("0001-01-01T00:30:00+01:00"))
 
+    def test_reads_rfc_3339_date_times_in_either_case_and_with_any_offset(self):
+        utc = datetime(2027, 8, 13, 4, 0, tzinfo=timezone.utc)
+        for text in (
+            "2027-08-13T04:00:00Z",
+            "2027-08-13t04:00:00z",
+            "2027-08-13T09:30:00+05:30",
+            "2027-08-12T20:00:00-08:00",
+            "2027-08-13T04:00:00-00:00",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(ce.parse_rdap_date(text), utc)
+        # A fraction is cut to microseconds, never rounded up into the next second.
+        self.assertEqual(ce.parse_rdap_date("2027-08-13T04:00:00.5Z"), utc.replace(microsecond=500000))
+        self.assertEqual(ce.parse_rdap_date("2027-08-13T04:00:00.9999999z"), utc.replace(microsecond=999999))
+        self.assertEqual(ce.parse_rdap_date("2028-02-29T00:00:00Z"), datetime(2028, 2, 29, tzinfo=timezone.utc))
+
+    def test_never_guesses_a_missing_part_or_reads_another_form(self):
+        # SYNTHETIC values RFC 3339's date-time doesn't allow. Reading one would mean guessing what the
+        # registry meant (midnight, UTC, a week number), and spaces around a date aren't trimmed away.
+        for text in (
+            "2027-08-13",
+            "2027-08-13T04:00:00",
+            "2027-08-13T04:00Z",
+            "2027-08-13T04Z",
+            "2027-08-13 04:00:00Z",
+            "20270813T040000Z",
+            "2027-W32-5T04:00:00Z",
+            "2027-08-13T04:00:00.Z",
+            "2027-08-13T04:00:00,5Z",
+            "2027-08-13T04:00:00+0530",
+            "2027-08-13T04:00:00+05",
+            " 2027-08-13T04:00:00Z",
+            "2027-08-13T04:00:00Z\n",
+            "٢٠٢٧-08-13T04:00:00Z",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(ce.parse_rdap_date(text))
+
+    def test_fields_out_of_range_are_unreadable_never_rolled_over(self):
+        for text in (
+            "2027-13-01T00:00:00Z",
+            "2027-02-29T00:00:00Z",
+            "2027-04-31T00:00:00Z",
+            "0000-01-01T00:00:00Z",
+            "2027-08-13T24:00:00Z",
+            "2027-08-13T04:60:00Z",
+            # timedelta would read +01:60 as +02:00 without a word.
+            "2027-08-13T04:00:00+01:60",
+            "2027-08-13T04:00:00+24:00",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(ce.parse_rdap_date(text))
+
+    def test_a_leap_second_is_unknown_rather_than_moved(self):
+        # RFC 3339 allows :60 for a leap second. datetime can't hold one, and moving it to the next
+        # second would report a time the registry didn't give, so it stays unreadable.
+        self.assertIsNone(ce.parse_rdap_date("2016-12-31T23:59:60Z"))
+
+    def test_a_date_that_is_not_text_is_unreadable(self):
+        for value in (None, 20270813, 1.5, True, ["2027-08-13T04:00:00Z"], {"date": "2027-08-13T04:00:00Z"}, b"2027-08-13T04:00:00Z"):
+            with self.subTest(value=value):
+                self.assertIsNone(ce.parse_rdap_date(value))
+        self.assertIsNone(ce.rdap_expiration({"events": [{"eventAction": "expiration", "eventDate": 20270813}]}))
+
     def test_domain_rule(self):
         self.assertEqual(ce.domain_finding(NOW + timedelta(days=31), NOW, 30).level, ce.OK)
         self.assertEqual(ce.domain_finding(NOW + timedelta(days=29), NOW, 30).level, ce.WARN)
