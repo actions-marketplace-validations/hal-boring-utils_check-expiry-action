@@ -44,6 +44,8 @@ BOOTSTRAP = {
 LIST_REGISTERED = "if it's a subdomain, also list its registered domain (such as example.com for www.example.com) in 'domains'"
 NOT_FOUND = f"Unknown: not found in the registry under this exact name; {LIST_REGISTERED}"
 NOT_THIS_NAME = f"Unknown: the registry's answer is not a domain record for this exact name; {LIST_REGISTERED}"
+# What a registration row says when the registry's expiration event gives a date the action can't read.
+UNREADABLE = "Unknown: the registry's expiration event has no readable date"
 
 
 def rdap_url(name: str) -> str:
@@ -68,6 +70,12 @@ def registration(name: str, left_days: float, **names: str) -> tuple[int, dict]:
     """SYNTHETIC: a registry's RDAP record of the domain `name` (its ldhName), which expires in this
     many days. `names` adds a unicodeName."""
     return 200, {"objectClassName": "domain", "ldhName": name, **names, "events": expiring(left_days)}
+
+
+def dated(name: str, event_date: object) -> tuple[int, dict]:
+    """SYNTHETIC: a registry's RDAP record of the domain `name` whose expiration event gives this
+    eventDate exactly as written, readable or not."""
+    return 200, {"objectClassName": "domain", "ldhName": name, "events": [{"eventAction": "expiration", "eventDate": event_date}]}
 
 
 def verify_error(code: int, message: str) -> ssl.SSLCertVerificationError:
@@ -437,6 +445,66 @@ class ExactNames(unittest.TestCase):
         self.assertEqual({host: reg for host, (_, reg) in table(summary).items()}, {host: NOT_THIS_NAME for host in answers})
         self.assertIn("0 failures, 0 warnings, 6 registration dates unknown.", summary)
         self.assertEqual(fake.requests, [ce.BOOTSTRAP_URL] + [rdap_url(host) for host in answers])
+
+
+class RegistryDates(unittest.TestCase):
+    """A registration fails only on an expiry date the action can read as an RFC 3339 date-time. Any
+    other date is unknown, so a malformed answer can't fail a run or put a made-up date in the report."""
+
+    def test_an_unreadable_expiry_date_is_unknown_and_never_fails_the_run(self):
+        # SYNTHETIC eventDates this action can't read as RFC 3339 date-times. Read leniently, the past
+        # ones would fail a registration nobody saw expire, and the zoneless one would warn.
+        soon = NOW + timedelta(days=10)
+        dates = {
+            "dateonly.example": "2020-01-01",
+            "zoneless.example": soon.strftime("%Y-%m-%dT%H:%M:%S"),
+            "minutes.example": "2020-01-01T00:00Z",
+            "week.example": "2020-W01-3T00:00:00Z",
+            "offset.example": "2020-01-01T00:00:00+01:60",
+            "spaced.example": " 2020-01-01T00:00:00Z",
+            "leap.example": "2016-12-31T23:59:60Z",
+            "number.example": 20200101,
+        }
+        fake = FakeNetwork({host: HEALTHY for host in dates}, {rdap_url(host): dated(host, date) for host, date in dates.items()})
+        code, log, summary, outputs = run(fake, domains=" ".join(dates))
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, "warnings=0\nfailures=0\n")
+        self.assertEqual(commands(log), [])
+        self.assertEqual(log.count(f"  registration: {UNREADABLE}\n"), len(dates))
+        rows = table(summary)
+        self.assertEqual(list(rows), list(dates))
+        self.assertTrue(all(cert.startswith("OK: expires ") for cert, _ in rows.values()), rows)
+        self.assertEqual({host: reg for host, (_, reg) in rows.items()}, {host: UNREADABLE for host in dates})
+        self.assertIn("0 failures, 0 warnings, 8 registration dates unknown.", summary)
+        self.assertEqual(fake.requests, [ce.BOOTSTRAP_URL] + [rdap_url(host) for host in dates])
+
+    def test_a_readable_expiry_date_in_the_past_still_fails(self):
+        # SYNTHETIC RFC 3339 date-times in the forms this reads: upper or lower case, a fraction
+        # longer than microseconds, and offsets east and west of UTC.
+        upper, lower, east, west = (NOW - timedelta(days=days) for days in (3.5, 2.5, 1.5, 4.5))
+        dates = {
+            "upper.example": upper.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "lower.example": lower.strftime("%Y-%m-%dt%H:%M:%S.%f789z"),
+            "east.example": east.astimezone(timezone(timedelta(hours=5, minutes=30))).strftime("%Y-%m-%dT%H:%M:%S+05:30"),
+            "west.example": west.astimezone(timezone(timedelta(hours=-8))).strftime("%Y-%m-%dT%H:%M:%S-08:00"),
+        }
+        messages = {
+            "upper.example": f"expires {upper:%Y-%m-%d} (expired 3 days ago)",
+            "lower.example": f"expires {lower:%Y-%m-%d} (expired 2 days ago)",
+            "east.example": f"expires {east:%Y-%m-%d} (expired 1 day ago)",
+            "west.example": f"expires {west:%Y-%m-%d} (expired 4 days ago)",
+        }
+        fake = FakeNetwork({host: HEALTHY for host in dates}, {rdap_url(host): dated(host, date) for host, date in dates.items()})
+        for fail_on_warning in ("true", "false"):
+            with self.subTest(fail_on_warning=fail_on_warning):
+                code, log, summary, outputs = run(fake, domains=" ".join(dates), fail_on_warning=fail_on_warning)
+                self.assertEqual(code, 1)
+                self.assertEqual(outputs, "warnings=0\nfailures=4\n")
+                self.assertEqual(commands(log), [f"::error title=Domain {host}::{message}" for host, message in messages.items()])
+                rows = table(summary)
+                self.assertTrue(all(cert.startswith("OK: expires ") for cert, _ in rows.values()), rows)
+                self.assertEqual({host: reg for host, (_, reg) in rows.items()}, {host: f"Failure: {message}" for host, message in messages.items()})
+                self.assertIn("4 failures, 0 warnings, 0 registration dates unknown.", summary)
 
 
 class IpAddresses(unittest.TestCase):

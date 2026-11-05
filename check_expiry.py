@@ -31,7 +31,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 USER_AGENT = "boringutils-expiry-action/1.1 (+https://boringutils.com/expiry-watch)"
 BOOTSTRAP_URL = "https://data.iana.org/rdap/dns.json"
@@ -56,6 +56,10 @@ LIST_REGISTERED = "if it's a subdomain, also list its registered domain (such as
 
 # A host name label: letters, digits, hyphens and underscores, 1 to 63 long, no hyphen at either end.
 HOST_LABEL = re.compile(r"[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?")
+# An RDAP date (RFC 9083 section 3) read as RFC 3339's date-time (section 5.6) and nothing looser: a
+# full date, T, hours, minutes and seconds, an optional fraction, then Z or a numeric offset. ASCII
+# digits only; T and Z in either case.
+RDAP_DATE = re.compile(r"([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt]([0-9]{2}):([0-9]{2}):([0-9]{2})(?:\.([0-9]+))?(?:[Zz]|([+-])([0-9]{2}):([0-9]{2}))")
 # Characters Markdown or HTML could read as markup inside a table cell.
 MARKDOWN_SPECIAL = re.compile(r"([\\`*_{}\[\]<>|~&!#$])")
 # What a registry lookup can raise: network and TLS errors, broken HTTP, a URL urllib refuses.
@@ -154,39 +158,45 @@ def cert_warn_days(lifetime_days: float, setting: str) -> float:
     return float(whole_days(setting))
 
 
-def parse_rdap_date(value: str) -> datetime | None:
-    """Parses an RDAP eventDate (RFC 3339) into an aware UTC datetime."""
-    if not isinstance(value, str) or not value:
+def parse_rdap_date(value: object) -> datetime | None:
+    """Parses an RDAP eventDate into an aware UTC datetime, or None when it isn't an RFC 3339 date-time
+    this can read. Nothing is guessed or cleaned up: a date without a time or an offset, another ISO 8601
+    form, surrounding spaces and a field out of range are all unreadable, as is a leap second (:60),
+    which datetime can't hold."""
+    match = RDAP_DATE.fullmatch(value) if isinstance(value, str) else None
+    if not match:
         return None
-    text = value.strip().replace("Z", "+00:00").replace("z", "+00:00")
-    if "." in text:
-        # Trim fractional seconds to microseconds, which older Pythons require.
-        head, rest = text.split(".", 1)
-        digits = ""
-        while rest and rest[0].isdigit():
-            digits, rest = digits + rest[0], rest[1:]
-        text = f"{head}.{digits[:6].ljust(6, '0')}{rest}"
-    try:
-        parsed = datetime.fromisoformat(text)
-    except ValueError:
+    year, month, day, hour, minute, second, fraction, sign, offset_hour, offset_minute = match.groups()
+    # Checked here because timedelta would quietly read +01:60 as +02:00.
+    if sign and (int(offset_hour) > 23 or int(offset_minute) > 59):
         return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=timezone.utc)
+    offset = timedelta(hours=int(offset_hour or 0), minutes=int(offset_minute or 0))
+    zone = timezone(-offset if sign == "-" else offset)
+    # A fraction is cut to microseconds, never rounded up into the next second.
+    microsecond = int((fraction or "")[:6].ljust(6, "0"))
     try:
+        parsed = datetime(int(year), int(month), int(day), int(hour), int(minute), int(second), microsecond, tzinfo=zone)
         return parsed.astimezone(timezone.utc)
-    except OverflowError:
-        # An offset that pushes the date past year 1 or 9999 in UTC; unreadable, not a reason to stop the run.
+    except (ValueError, OverflowError):
+        # A field out of range (February 30, 24:00, a leap second), or an offset that pushes the date
+        # past year 1 or 9999 in UTC; unreadable, not a reason to stop the run.
         return None
 
 
-def rdap_expiration(body: object) -> datetime | None:
-    """The date of the event with eventAction "expiration", or None when not published."""
+def rdap_expiration_event(body: object) -> dict | None:
+    """The first event with eventAction "expiration", or None when the answer has none."""
     if not isinstance(body, dict) or not isinstance(body.get("events"), list):
         return None
     for event in body["events"]:
         if isinstance(event, dict) and str(event.get("eventAction", "")).lower() == "expiration":
-            return parse_rdap_date(event.get("eventDate", ""))
+            return event
     return None
+
+
+def rdap_expiration(body: object) -> datetime | None:
+    """The date of the event with eventAction "expiration", or None when none is published or its date is unreadable."""
+    event = rdap_expiration_event(body)
+    return parse_rdap_date(event.get("eventDate")) if event is not None else None
 
 
 def rdap_name(value: object) -> str | None:
@@ -380,7 +390,11 @@ class Registry:
             return Finding(UNKNOWN, "lookup failed: the registry's answer is not RDAP JSON")
         if not rdap_is_for(body, host):
             return Finding(UNKNOWN, f"the registry's answer is not a domain record for this exact name; {LIST_REGISTERED}")
-        return domain_finding(rdap_expiration(body), self.now, self.warn_days)
+        expires = rdap_expiration(body)
+        # An expiration date this can't read is unknown: never guessed at, and never called unpublished.
+        if expires is None and rdap_expiration_event(body) is not None:
+            return Finding(UNKNOWN, "the registry's expiration event has no readable date")
+        return domain_finding(expires, self.now, self.warn_days)
 
 
 # ---------- reporting ----------
