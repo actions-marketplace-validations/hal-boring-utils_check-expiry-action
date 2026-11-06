@@ -141,6 +141,89 @@ class ParseDomains(unittest.TestCase):
         # Dropping it would leave the user believing it was checked.
         self.assertEqual(ce.parse_domains("https:// https://[2001:db8::1"), ["https://", "https://[2001:db8::1"])
 
+    def test_drops_one_final_dot_and_keeps_any_other_so_it_can_be_rejected(self):
+        # Stripping every dot dropped a lone "." without a word and checked .example.com as example.com.
+        cases = {
+            "example.com\n.": ["example.com", "."],
+            ".example.com": [".example.com"],
+            "example.com..": ["example.com.."],
+            "..": [".."],
+            "https://.example.com/": [".example.com"],
+            "https://example.com../": ["example.com.."],
+        }
+        for text, hosts in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(ce.parse_domains(text), hosts)
+                self.assertIsNone(ce.host_kind(hosts[-1]))
+
+    def test_keeps_brackets_that_are_not_a_whole_host_and_port_so_they_can_be_rejected(self):
+        # None is one bracketed host with nothing or a numeric port after it, though most hold a
+        # valid address. Some Python versions' urlsplit accepts this and gives hostname
+        # 2001:db8::1; others raise. Rely on neither.
+        entries = (
+            "[2001:db8::1",
+            "2001:db8::1]",
+            "[2001:db8::1]]",
+            "[[2001:db8::1]]",
+            "[2001:db8::1][2001:db8::2]",
+            "x[2001:db8::1]",
+            "[2001:db8::1]unexpected",
+            "[2001:db8::1].",
+            "[2001:db8::1]:",
+            "[2001:db8::1]:https",
+            "[2001:db8::1]:443x",
+            "[2001:db8::1]:443:443",
+            "[]",
+            "user@[2001:db8::1]unexpected",
+            "https://[2001:db8::1]unexpected/",
+            "https://[2001:db8::1]:/",
+            "https://[2001:db8::1]:https/",
+            "https://[2001:db8::1]]/",
+            "https://user@x[2001:db8::1]/",
+        )
+        for entry in entries:
+            with self.subTest(entry=entry):
+                self.assertEqual(ce.parse_domains(entry), [entry])
+                self.assertIsNone(ce.host_kind(entry))
+
+    def test_keeps_an_empty_host_or_brackets_around_no_ipv6_address_so_they_can_be_rejected(self):
+        # Before, the first four were dropped without a word, so a mixed list looked fully checked,
+        # and brackets came off any contents: [example.com] was checked as example.com. Brackets
+        # hold an IPv6 address and nothing else.
+        entries = (
+            "/",
+            "?q",
+            ":443",
+            "user@",
+            "[example.com]",
+            "[example.com.]",
+            "[192.0.2.1]",
+            "[192.0.2.1]:443",
+            "[2001:db8::g]",
+            "user@[example.com]:443/x",
+            "https://[example.com]/",
+            "https://[192.0.2.1]:443/",
+        )
+        for entry in entries:
+            with self.subTest(entry=entry):
+                self.assertEqual(ce.parse_domains(entry), [entry])
+                self.assertIsNone(ce.host_kind(entry))
+        mixed = "example.com / [example.com] 192.0.2.1 :443 [2001:db8::1]"
+        self.assertEqual(ce.parse_domains(mixed), ["example.com", "/", "[example.com]", "192.0.2.1", ":443", "2001:db8::1"])
+        # A zone ("%eth0") names a local interface, in brackets or not.
+        self.assertIsNone(ce.host_kind(ce.parse_domains("[fe80::1%eth0]")[0]))
+
+    def test_still_reads_one_final_dot_user_info_ports_and_bracketed_ipv6(self):
+        text = (
+            "Example.com. https://user:pw@www.example.com.:8443/a?b=c 192.0.2.1. bücher.example. "
+            "[2001:DB8::1] [2001:db8::2]:8443 user@[2001:db8::3]:443/x https://[2001:db8::4]:443/status "
+            "https://u@[2001:db8::5]/ 2001:db8::6"
+        )
+        hosts = ["example.com", "www.example.com", "192.0.2.1", "xn--bcher-kva.example"]
+        hosts += [f"2001:db8::{n}" for n in range(1, 7)]
+        self.assertEqual(ce.parse_domains(text), hosts)
+        self.assertTrue(all(ce.host_kind(host) for host in hosts), hosts)
+
 
 class HostKind(unittest.TestCase):
     def test_accepts_host_names_and_ip_addresses(self):

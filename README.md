@@ -79,7 +79,7 @@ Requests to IANA and the registries name the action in their user agent, `boring
 | `domain-days` | `30` | Warn when a registration expires in fewer than this many days. A whole number; `0` never warns. An expired registration always fails. |
 | `fail-on-warning` | `true` | `true` or `false`. With `false`, warnings are reported without failing the step. Failures always fail it. |
 
-An input the action can’t read, such as `cert-days: -5`, an entry in `domains` that isn’t a domain name or IP address, an international name it could read as two different domains (see [Limits](#limits)), or `fail-on-warning: no`, fails the step with an error that names it, before anything is checked.
+An input the action can’t read, such as `cert-days: -5`, an entry in `domains` that isn’t a domain name or IP address, an international name it could read as two different domains (see [Limits](#limits)), or `fail-on-warning: no`, fails the step with an error that names it, before anything is checked. This covers a lone `.`, a leading dot, more than one final dot (one final dot is fine), and brackets left unclosed, followed by anything but a numeric port, or around anything but an IPv6 address, such as `.example.com` or `[2001:db8::1]unexpected`: they’re named, never trimmed into a host you didn’t list.
 
 ## Outputs
 

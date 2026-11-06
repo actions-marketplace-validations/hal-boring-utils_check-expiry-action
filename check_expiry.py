@@ -56,6 +56,10 @@ LIST_REGISTERED = "if it's a subdomain, also list its registered domain (such as
 
 # A host name label: letters, digits, hyphens and underscores, 1 to 63 long, no hyphen at either end.
 HOST_LABEL = re.compile(r"[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?")
+# A host in brackets (an IPv6 address) and an optional port in ASCII digits, matched against the
+# whole host and port. Some Python versions' urlsplit accepts https://[2001:db8::1]unexpected/
+# and gives hostname 2001:db8::1; others raise. Rely on neither.
+BRACKETED_HOST = re.compile(r"\[([^\[\]]+)\](?::[0-9]+)?")
 # An RDAP date (RFC 9083 section 3) read as RFC 3339's date-time (section 5.6) and nothing looser: a
 # full date, T, hours, minutes and seconds, an optional fraction, then Z or a numeric offset. ASCII
 # digits only; T and Z in either case.
@@ -92,26 +96,38 @@ class Settings:
 
 
 def parse_domains(text: str) -> list[str]:
-    """Splits on newlines, commas and spaces; skips # comments; strips schemes, paths, ports and
-    IPv6 brackets; lowercases; writes international names in their xn-- form; dedupes. An entry
-    with no host in it, or with a character IDNA versions encode differently, stays as typed, so
-    the input check can name it rather than drop it or check another domain."""
+    """Splits on newlines, commas and spaces; skips # comments; strips schemes, user info, paths,
+    ports, IPv6 brackets and one final dot; lowercases; writes international names in their xn--
+    form; dedupes. Any other dot is kept, and an entry with no host in it, with brackets that aren't
+    one whole IPv6 address followed by nothing or a numeric port, or with a character IDNA versions
+    encode differently, stays as typed, so the input check can name it rather than drop it or check
+    another domain."""
     seen: list[str] = []
     words = [word for line in text.splitlines() for word in line.split("#", 1)[0].replace(",", " ").split()]
-    for host in words:
-        if "://" in host:
+    for word in words:
+        if "://" in word:
             try:
-                host = urllib.parse.urlsplit(host).hostname or host
+                parts = urllib.parse.urlsplit(word)
+                hostport, host = parts.netloc.rpartition("@")[2], parts.hostname or word
             except ValueError:
-                pass
+                hostport, host = "", word
         else:
-            host = host.split("/", 1)[0].split("?", 1)[0]
-            host = host.rsplit("@", 1)[-1]
-            if host.startswith("["):
-                host = host[1:].split("]", 1)[0]
-            elif host.count(":") == 1:
-                host = host.split(":", 1)[0]
-        host = host.strip(".").lower()
+            hostport = word.split("/", 1)[0].split("?", 1)[0].rsplit("@", 1)[-1]
+            host = hostport.split(":", 1)[0] if hostport.count(":") == 1 else hostport
+        if "[" in hostport or "]" in hostport:
+            # Brackets hold an IPv6 address and nothing else, so [example.com] and [192.0.2.1] stay as typed.
+            bracketed, host = BRACKETED_HOST.fullmatch(hostport), word
+            if bracketed:
+                try:
+                    ipaddress.IPv6Address(bracketed.group(1))
+                    host = bracketed.group(1)
+                except ValueError:
+                    pass
+        # One final dot is the DNS root; any other dot stays for the input check to name.
+        elif host.endswith(".") and not host.endswith("..") and host != ".":
+            host = host[:-1]
+        # An entry with no host in it (/, ?q, :443, user@) stays as typed, never dropped.
+        host = (host or word).lower()
         if host and not IDNA_DEVIATIONS.intersection(host):
             try:
                 host = host.encode("idna").decode("ascii")
