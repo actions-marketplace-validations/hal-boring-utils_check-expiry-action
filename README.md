@@ -28,9 +28,9 @@ jobs:
           domains: |
             example.com
             www.example.com
-            example.co.uk
-            api.example.co.uk
 ```
+
+`example.com` and `www.example.com` are example hosts: replace them with your own HTTPS hosts.
 
 List each registered domain itself, not only its subdomains: a registration is looked up under exactly the name you list (see [What it checks](#what-it-checks)).
 
@@ -78,6 +78,8 @@ Requests to IANA and the registries name the action in their user agent, `boring
 | `cert-days` | `auto` | When a certificate warns. `auto` uses the lifetime rule below. A whole number warns when fewer than that many days are left; `0` never warns. An expired certificate always fails. |
 | `domain-days` | `30` | Warn when a registration expires in fewer than this many days. A whole number; `0` never warns. An expired registration always fails. |
 | `fail-on-warning` | `true` | `true` or `false`. With `false`, warnings are reported without failing the step. Failures always fail it. |
+
+Everything from the first `#` on a line to the end of that line is read as a comment, even when the `#` is inside a URL. So the line `https://app.example.com/#/login, https://api.example.com/` checks `app.example.com` and skips `api.example.com`, because that host comes after the `#`. To keep later hosts from being dropped, put each URL on its own line, or remove the `#` and everything after it from each URL before you list it.
 
 An input the action can’t read, such as `cert-days: -5`, an entry in `domains` that isn’t a domain name or IP address, an international name it could read as two different domains (see [Limits](#limits)), or `fail-on-warning: no`, fails the step with an error that names it, before anything is checked. This covers a lone `.`, a leading dot, more than one final dot (one final dot is fine), and brackets left unclosed, followed by anything but a numeric port, or around anything but an IPv6 address, such as `.example.com` or `[2001:db8::1]unexpected`: they’re named, never trimmed into a host you didn’t list.
 

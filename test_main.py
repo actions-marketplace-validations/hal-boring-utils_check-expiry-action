@@ -197,6 +197,46 @@ def commands(log: str) -> list[str]:
 
 
 class HealthyRun(unittest.TestCase):
+    def test_the_readme_usage_example_reports_both_hosts(self):
+        # The README's Usage example as written there, so the hosts a reader tries before replacing them
+        # are the ones tested. The answers are SYNTHETIC, as above: nothing is looked up for real.
+        lines = read(os.path.join(os.path.dirname(SCRIPT), "README.md")).splitlines()
+        self.assertIn("```yaml", lines)
+        start = lines.index("```yaml") + 1
+        example = lines[start : lines.index("```", start)]
+        keys = [line.strip() for line in example]
+        self.assertIn("domains: |", keys)
+        key = keys.index("domains: |")
+        depth = len(example[key]) - len(example[key].lstrip())
+        block = []
+        for line in example[key + 1 :]:
+            if line.strip() and len(line) - len(line.lstrip()) <= depth:
+                break
+            block.append(line)
+        while block and not block[-1].strip():
+            block.pop()
+        self.assertTrue(block, "the README example's 'domains' block is empty")
+        margin = min(len(line) - len(line.lstrip()) for line in block if line.strip())
+        # What GitHub passes for a literal block (|): its lines less their indentation, and one final newline.
+        domains = "".join(line[margin:] + "\n" for line in block)
+        self.assertEqual(domains.splitlines(), ["example.com", "www.example.com"])
+        fake = FakeNetwork(
+            {"example.com": HEALTHY, "www.example.com": HEALTHY},
+            {EXAMPLE_COM: registration("example.com", 400.5), rdap_url("www.example.com"): (404, {})},
+        )
+        code, log, summary, outputs = run(fake, domains=domains)
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, "warnings=0\nfailures=0\n")
+        self.assertEqual(commands(log), [])
+        rows = table(summary)
+        self.assertEqual(list(rows), ["example.com", "www.example.com"])
+        self.assertTrue(all(cert.startswith("OK: expires ") for cert, _ in rows.values()), rows)
+        self.assertTrue(rows["example.com"][1].startswith("OK: expires "), rows)
+        self.assertEqual(rows["www.example.com"][1], NOT_FOUND)
+        self.assertIn("0 failures, 0 warnings, 1 registration date unknown.", summary)
+        self.assertEqual(fake.connections, [("example.com", 443), ("www.example.com", 443)])
+        self.assertEqual(fake.requests, [ce.BOOTSTRAP_URL, EXAMPLE_COM, rdap_url("www.example.com")])
+
     def test_reports_every_host_and_passes(self):
         # The guide's example. The registry has no record of www.example.com, as with real registries.
         fake = FakeNetwork(
