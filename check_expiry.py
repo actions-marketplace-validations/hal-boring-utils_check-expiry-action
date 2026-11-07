@@ -100,7 +100,7 @@ def parse_domains(text: str) -> list[str]:
     ports, IPv6 brackets and one final dot; lowercases; writes international names in their xn--
     form; dedupes. Any other dot is kept, and an entry with no host in it, with brackets that aren't
     one whole IPv6 address followed by nothing or a numeric port, or with a character IDNA versions
-    encode differently, stays as typed, so the input check can name it rather than drop it or check
+    encode differently, stays as typed, so the input check can refuse it rather than drop it or check
     another domain."""
     seen: list[str] = []
     words = [word for line in text.splitlines() for word in line.split("#", 1)[0].replace(",", " ").split()]
@@ -123,7 +123,7 @@ def parse_domains(text: str) -> list[str]:
                     host = bracketed.group(1)
                 except ValueError:
                     pass
-        # One final dot is the DNS root; any other dot stays for the input check to name.
+        # One final dot is the DNS root; any other dot stays for the input check to refuse.
         elif host.endswith(".") and not host.endswith("..") and host != ".":
             host = host[:-1]
         # An entry with no host in it (/, ?q, :443, user@) stays as typed, never dropped.
@@ -464,12 +464,16 @@ def read_settings() -> tuple[Settings, list[str]]:
     invalid = [host for host in domains if host_kind(host) is None]
     ambiguous = [host for host in invalid if IDNA_DEVIATIONS.intersection(host)]
     unreadable = [host for host in invalid if host not in ambiguous]
+    # Each error names its input and the form it takes, never the value: a pasted URL can carry a password.
     if unreadable:
-        errors.append(f"'domains' has entries that are not domain names or IP addresses: {', '.join(unreadable)}")
+        errors.append(
+            "'domains' has entries that are not domain names or IP addresses. "
+            "List each as a domain name or IP address, on its own or as the host of a URL."
+        )
     if ambiguous:
         errors.append(
-            f"'domains' has international names with ß, ς or a zero-width joiner or non-joiner, which tools convert to "
-            f"two different domains: {', '.join(ambiguous)}. List each in its xn-- form."
+            "'domains' has international names with ß, ς or a zero-width joiner or non-joiner, which tools convert to "
+            "two different domains. List each in its xn-- form."
         )
     if not domains:
         errors.append("No domains given. Set the 'domains' input.")
@@ -477,16 +481,16 @@ def read_settings() -> tuple[Settings, list[str]]:
     try:
         cert_warn_days(90, cert_setting)
     except ValueError:
-        errors.append(f"'cert-days' must be 'auto' or a whole number of days, 0 or more, not '{cert_setting}'.")
+        errors.append("'cert-days' must be 'auto' or a whole number of days, 0 or more.")
     domain_text = os.environ.get("INPUT_DOMAIN_DAYS", "").strip() or "30"
     try:
         domain_days = whole_days(domain_text)
     except ValueError:
         domain_days = 0
-        errors.append(f"'domain-days' must be a whole number of days, 0 or more, not '{domain_text}'.")
+        errors.append("'domain-days' must be a whole number of days, 0 or more.")
     fail_text = os.environ.get("INPUT_FAIL_ON_WARNING", "").strip().lower() or "true"
     if fail_text not in ("true", "false"):
-        errors.append(f"'fail-on-warning' must be 'true' or 'false', not '{fail_text}'.")
+        errors.append("'fail-on-warning' must be 'true' or 'false'.")
     return Settings(domains, cert_setting, domain_days, fail_text == "true"), errors
 
 

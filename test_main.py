@@ -574,6 +574,44 @@ class IpAddresses(unittest.TestCase):
 
 
 class InvalidInputs(unittest.TestCase):
+    def test_an_invalid_input_is_named_and_explained_but_never_echoed(self):
+        # A pasted URL can carry a password or a token, and a run log can be public, so the error names
+        # the input and says how to fix it without repeating what was typed. Every value here is
+        # SYNTHETIC: made-up markers under reserved names, never a real credential or a user's input.
+        url = "https://qa:SYNTHETIC_PASSWORD_MARKER@[example.com]/?token=SYNTHETIC_QUERY_MARKER"
+        good = "synthetic-good.example"
+        synthetic = (
+            "SYNTHETIC_PASSWORD_MARKER",
+            "SYNTHETIC_QUERY_MARKER",
+            "[example.com]",
+            good,
+            "SYNTHETIC_CERT_DAYS_MARKER",
+            "SYNTHETIC_DOMAIN_DAYS_MARKER",
+            "SYNTHETIC_FAIL_ON_WARNING_MARKER",
+        )
+        domain_fix = ("'domains'", "domain name", "IP address")
+        cases = {
+            "a URL with user info and a query": ({"domains": url}, domain_fix),
+            # A good entry beside it is neither checked nor named.
+            "the same URL among good entries": ({"domains": f"{good}\n{url}"}, domain_fix),
+            "cert-days": ({"domains": good, "cert_days": "SYNTHETIC_CERT_DAYS_MARKER"}, ("'cert-days'", "'auto'", "whole number of days")),
+            "domain-days": ({"domains": good, "domain_days": "SYNTHETIC_DOMAIN_DAYS_MARKER"}, ("'domain-days'", "whole number of days")),
+            "fail-on-warning": ({"domains": good, "fail_on_warning": "SYNTHETIC_FAIL_ON_WARNING_MARKER"}, ("'fail-on-warning'", "'true'", "'false'")),
+        }
+        for named, (inputs, explained) in cases.items():
+            with self.subTest(named):
+                fake = FakeNetwork({}, {})
+                code, log, summary, outputs = run(fake, **inputs)
+                self.assertEqual(code, 2)
+                self.assertEqual(len(commands(log)), 1, log)
+                self.assertTrue(commands(log)[0].startswith("::error::"), log)
+                for part in explained:
+                    self.assertIn(part, commands(log)[0])
+                # Compared without case: entries and two of the options are lowercased as they're read.
+                shown = (log + summary + outputs).casefold()
+                self.assertEqual([value for value in synthetic if value.casefold() in shown], [])
+                self.assertEqual((fake.connections, fake.requests, summary, outputs), ([], [], "", ""))
+
     def test_stop_the_step_before_anything_is_checked(self):
         cases = {
             "cert-days": {"domains": "example.com", "cert_days": "-5"},
@@ -582,7 +620,7 @@ class InvalidInputs(unittest.TestCase):
             "'domains' has entries that are not domain names": {"domains": "example.com\n*.example.com"},
             "No domains given": {"domains": "# all commented out"},
             # Checked as fass.example, it would report another domain's certificate and registration.
-            "two different domains: faß.example, λας.example. List each in its xn-- form.": {"domains": "example.com faß.example λας.example"},
+            "two different domains. List each in its xn-- form.": {"domains": "example.com faß.example λας.example"},
         }
         for named, inputs in cases.items():
             with self.subTest(named):
@@ -592,6 +630,8 @@ class InvalidInputs(unittest.TestCase):
                 self.assertEqual(len(commands(log)), 1)
                 self.assertTrue(commands(log)[0].startswith("::error::"))
                 self.assertIn(named, commands(log)[0])
+                # Named by its input, never by what was typed: every entry here is under example.
+                self.assertNotIn("example", commands(log)[0])
                 self.assertEqual((fake.connections, fake.requests, summary, outputs), ([], [], "", ""))
 
     def test_a_domain_entry_cannot_forge_a_workflow_command(self):
@@ -600,10 +640,11 @@ class InvalidInputs(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(len(commands(log)), 1)
         self.assertTrue(commands(log)[0].startswith("::error::'domains' has entries"))
-        # The entry is echoed (lowercased) with its % escaped, so GitHub can't decode it into a line break.
-        self.assertIn("%250a::notice::hi", commands(log)[0])
+        # The entries are never repeated, so no part of them reaches the log for GitHub to read as a command.
+        forged = ("::warning", "title=", "all clear", "nothing expires", "%0a", "%250a", "::notice")
+        self.assertEqual([part for part in forged if part in log.casefold()], [])
 
-    def test_a_malformed_host_is_named_and_nothing_is_checked(self):
+    def test_a_malformed_host_is_refused_and_nothing_is_checked(self):
         # Before, each could be dropped, or trimmed into a valid host it doesn't name, and the run went on.
         entries = (
             ".",
@@ -623,7 +664,11 @@ class InvalidInputs(unittest.TestCase):
             "[192.0.2.1]",
             "https://[example.com]/",
         )
-        named = "::error::'domains' has entries that are not domain names or IP addresses: "
+        # The same error for every entry: the input is named and the entry is never repeated.
+        refused = (
+            "::error::'domains' has entries that are not domain names or IP addresses. "
+            "List each as a domain name or IP address, on its own or as the host of a URL."
+        )
         for entry in entries:
             # Alone, and among good entries, which are never checked either.
             for domains in (entry, f"example.com\n{entry}, 192.0.2.1"):
@@ -631,12 +676,12 @@ class InvalidInputs(unittest.TestCase):
                     fake = FakeNetwork({}, {})
                     code, log, summary, outputs = run(fake, domains=domains)
                     self.assertEqual(code, 2)
-                    self.assertEqual(commands(log), [named + entry])
+                    self.assertEqual(commands(log), [refused])
                     self.assertEqual((fake.connections, fake.requests, summary, outputs), ([], [], "", ""))
         fake = FakeNetwork({}, {})
         code, log, summary, outputs = run(fake, domains="\n".join(entries))
         self.assertEqual(code, 2)
-        self.assertEqual(commands(log), [named + ", ".join(entries)])
+        self.assertEqual(commands(log), [refused])
         self.assertEqual((fake.connections, fake.requests, summary, outputs), ([], [], "", ""))
 
 
@@ -647,7 +692,7 @@ class Script(unittest.TestCase):
         env = {"INPUT_DOMAINS": "example.com", "INPUT_CERT_DAYS": "-1"}
         result = subprocess.run([sys.executable, "-I", SCRIPT], env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertEqual(result.stdout, "::error::'cert-days' must be 'auto' or a whole number of days, 0 or more, not '-1'.\n")
+        self.assertEqual(result.stdout, "::error::'cert-days' must be 'auto' or a whole number of days, 0 or more.\n")
         self.assertEqual(result.stderr, "")
 
 
