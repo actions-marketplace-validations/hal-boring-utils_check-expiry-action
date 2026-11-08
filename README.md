@@ -28,9 +28,9 @@ jobs:
           domains: |
             example.com
             www.example.com
-            example.co.uk
-            api.example.co.uk
 ```
+
+`example.com` and `www.example.com` are example hosts: replace them with your own HTTPS hosts.
 
 List each registered domain itself, not only its subdomains: a registration is looked up under exactly the name you list (see [What it checks](#what-it-checks)).
 
@@ -79,7 +79,11 @@ Requests to IANA and the registries name the action in their user agent, `boring
 | `domain-days` | `30` | Warn when a registration expires in fewer than this many days. A whole number; `0` never warns. An expired registration always fails. |
 | `fail-on-warning` | `true` | `true` or `false`. With `false`, warnings are reported without failing the step. Failures always fail it. |
 
-An input the action can’t read, such as `cert-days: -5`, an entry in `domains` that isn’t a domain name or IP address, an international name it could read as two different domains (see [Limits](#limits)), or `fail-on-warning: no`, fails the step with an error that names it, before anything is checked.
+Everything from the first `#` on a line to the end of that line is read as a comment, even when the `#` is inside a URL. So the line `https://app.example.com/#/login, https://api.example.com/` checks `app.example.com` and skips `api.example.com`, because that host comes after the `#`. To keep later hosts from being dropped, put each URL on its own line, or remove the `#` and everything after it from each URL before you list it.
+
+An input the action can’t read, such as `cert-days: -5`, an entry in `domains` that isn’t a domain name or IP address, an international name it could read as two different domains (see [Limits](#limits)), or `fail-on-warning: no`, fails the step with an error that names the input and says what it accepts, before anything is checked. This covers a lone `.`, a leading dot, more than one final dot (one final dot is fine), and brackets left unclosed, followed by anything but a numeric port, or around anything but an IPv6 address, such as `.example.com` or `[2001:db8::1]unexpected`: they’re refused, never trimmed into a host you didn’t list.
+
+The error doesn’t repeat what you typed, so with a long list, check each entry against the rules above. That isn’t a way to keep a value private: GitHub may show a step’s inputs in the run log itself. List host names in `domains`, never a URL with a user name, password or token in it.
 
 ## Outputs
 
@@ -102,7 +106,7 @@ Certificates valid for only a few days have hours left by this rule, so a daily 
 ## Limits
 
 - **Exact names only, on purpose.** Earlier releases guessed a host’s registered domain from its last two or three labels, and the guess could be someone else’s registration: `shop.example.co.at` was looked up as `co.at`, and any date the registry gave for `co.at` was reported on that row. The action now looks up exactly the name you list and uses only the registry’s record of that name, so it doesn’t report another registration’s date as yours. In exchange, a subdomain’s registration is “Unknown” unless you list its registered domain too, and the registries see each name you list.
-- **International names with ß, ς, or a zero-width joiner or non-joiner** go in their `xn--` form. IDNA 2008 encodes `faß.de` as `xn--fa-hia.de`, while the older IDNA 2003, which [Python’s built-in codec](https://docs.python.org/3/library/codecs.html#module-encodings.idna) follows, makes it `fass.de`: two different domains. Rather than check the wrong one, the action stops with an error that names the entry.
+- **International names with ß, ς, or a zero-width joiner or non-joiner** go in their `xn--` form. IDNA 2008 encodes `faß.de` as `xn--fa-hia.de`, while the older IDNA 2003, which [Python’s built-in codec](https://docs.python.org/3/library/codecs.html#module-encodings.idna) follows, makes it `fass.de`: two different domains. Rather than check the wrong one, the action stops with an error that asks for the `xn--` form.
 - **One address.** The certificate check connects to whichever address the runner resolves. Behind a CDN or load balancer, other edges or nodes can serve a different certificate.
 - **Expired certificates.** When verification fails, the action reports the reason but not the dates, because Python only reads the dates of a certificate it verified.
 - **Port 443 only**, and the runner’s network: a host that is private or firewalled from GitHub’s runners shows as “could not check”.

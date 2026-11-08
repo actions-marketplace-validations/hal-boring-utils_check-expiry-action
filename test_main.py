@@ -2,7 +2,7 @@
 
 The network is mocked. Every host, certificate, registry answer and date here is SYNTHETIC, made up
 for these tests under reserved names (example.com and the .example and .test TLDs, RFC 2606; the
-192.0.2.0/24 documentation addresses, RFC 5737), or under a real public suffix (co.at, co.uk,
+192.0.2.0/24 and 2001:db8::/32 documentation addresses, RFCs 5737 and 3849), or under a real public suffix (co.at, co.uk,
 act.edu.au) where a test needs that suffix's shape. Each registry answer names the domain it is the
 record of, as real ones do. Nothing is looked up for real.
 Run from this folder: python3 -m unittest
@@ -197,6 +197,46 @@ def commands(log: str) -> list[str]:
 
 
 class HealthyRun(unittest.TestCase):
+    def test_the_readme_usage_example_reports_both_hosts(self):
+        # The README's Usage example as written there, so the hosts a reader tries before replacing them
+        # are the ones tested. The answers are SYNTHETIC, as above: nothing is looked up for real.
+        lines = read(os.path.join(os.path.dirname(SCRIPT), "README.md")).splitlines()
+        self.assertIn("```yaml", lines)
+        start = lines.index("```yaml") + 1
+        example = lines[start : lines.index("```", start)]
+        keys = [line.strip() for line in example]
+        self.assertIn("domains: |", keys)
+        key = keys.index("domains: |")
+        depth = len(example[key]) - len(example[key].lstrip())
+        block = []
+        for line in example[key + 1 :]:
+            if line.strip() and len(line) - len(line.lstrip()) <= depth:
+                break
+            block.append(line)
+        while block and not block[-1].strip():
+            block.pop()
+        self.assertTrue(block, "the README example's 'domains' block is empty")
+        margin = min(len(line) - len(line.lstrip()) for line in block if line.strip())
+        # What GitHub passes for a literal block (|): its lines less their indentation, and one final newline.
+        domains = "".join(line[margin:] + "\n" for line in block)
+        self.assertEqual(domains.splitlines(), ["example.com", "www.example.com"])
+        fake = FakeNetwork(
+            {"example.com": HEALTHY, "www.example.com": HEALTHY},
+            {EXAMPLE_COM: registration("example.com", 400.5), rdap_url("www.example.com"): (404, {})},
+        )
+        code, log, summary, outputs = run(fake, domains=domains)
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, "warnings=0\nfailures=0\n")
+        self.assertEqual(commands(log), [])
+        rows = table(summary)
+        self.assertEqual(list(rows), ["example.com", "www.example.com"])
+        self.assertTrue(all(cert.startswith("OK: expires ") for cert, _ in rows.values()), rows)
+        self.assertTrue(rows["example.com"][1].startswith("OK: expires "), rows)
+        self.assertEqual(rows["www.example.com"][1], NOT_FOUND)
+        self.assertIn("0 failures, 0 warnings, 1 registration date unknown.", summary)
+        self.assertEqual(fake.connections, [("example.com", 443), ("www.example.com", 443)])
+        self.assertEqual(fake.requests, [ce.BOOTSTRAP_URL, EXAMPLE_COM, rdap_url("www.example.com")])
+
     def test_reports_every_host_and_passes(self):
         # The guide's example. The registry has no record of www.example.com, as with real registries.
         fake = FakeNetwork(
@@ -517,8 +557,61 @@ class IpAddresses(unittest.TestCase):
         self.assertEqual(fake.connections, [("192.0.2.10", 443)])
         self.assertEqual(fake.requests, [])
 
+    def test_bracketed_ipv6_with_a_port_and_a_name_with_one_final_dot_are_checked(self):
+        # The forms the dot and bracket rules keep reading, each as the host it names.
+        hosts = ("example.com", "2001:db8::1", "2001:db8::2")
+        fake = FakeNetwork({host: HEALTHY for host in hosts}, {EXAMPLE_COM: registration("example.com", 400.5)})
+        entries = "https://user@Example.com./login [2001:db8::1]:8443 https://[2001:DB8::2]:443/status example.com. 2001:db8::1"
+        code, log, summary, outputs = run(fake, domains=entries)
+        self.assertEqual(code, 0)
+        self.assertEqual(outputs, "warnings=0\nfailures=0\n")
+        self.assertEqual(commands(log), [])
+        rows = table(summary)
+        self.assertEqual(list(rows), list(hosts))
+        self.assertEqual([rows[host][1] for host in hosts[1:]], ["Skipped: an IP address has no domain registration"] * 2)
+        self.assertEqual(fake.connections, [(host, 443) for host in hosts])
+        self.assertEqual(fake.requests, [ce.BOOTSTRAP_URL, EXAMPLE_COM])
+
 
 class InvalidInputs(unittest.TestCase):
+    def test_an_invalid_input_is_named_and_explained_but_never_echoed(self):
+        # A pasted URL can carry a password or a token, and a run log can be public, so the error names
+        # the input and says how to fix it without repeating what was typed. Every value here is
+        # SYNTHETIC: made-up markers under reserved names, never a real credential or a user's input.
+        url = "https://qa:SYNTHETIC_PASSWORD_MARKER@[example.com]/?token=SYNTHETIC_QUERY_MARKER"
+        good = "synthetic-good.example"
+        synthetic = (
+            "SYNTHETIC_PASSWORD_MARKER",
+            "SYNTHETIC_QUERY_MARKER",
+            "[example.com]",
+            good,
+            "SYNTHETIC_CERT_DAYS_MARKER",
+            "SYNTHETIC_DOMAIN_DAYS_MARKER",
+            "SYNTHETIC_FAIL_ON_WARNING_MARKER",
+        )
+        domain_fix = ("'domains'", "domain name", "IP address")
+        cases = {
+            "a URL with user info and a query": ({"domains": url}, domain_fix),
+            # A good entry beside it is neither checked nor named.
+            "the same URL among good entries": ({"domains": f"{good}\n{url}"}, domain_fix),
+            "cert-days": ({"domains": good, "cert_days": "SYNTHETIC_CERT_DAYS_MARKER"}, ("'cert-days'", "'auto'", "whole number of days")),
+            "domain-days": ({"domains": good, "domain_days": "SYNTHETIC_DOMAIN_DAYS_MARKER"}, ("'domain-days'", "whole number of days")),
+            "fail-on-warning": ({"domains": good, "fail_on_warning": "SYNTHETIC_FAIL_ON_WARNING_MARKER"}, ("'fail-on-warning'", "'true'", "'false'")),
+        }
+        for named, (inputs, explained) in cases.items():
+            with self.subTest(named):
+                fake = FakeNetwork({}, {})
+                code, log, summary, outputs = run(fake, **inputs)
+                self.assertEqual(code, 2)
+                self.assertEqual(len(commands(log)), 1, log)
+                self.assertTrue(commands(log)[0].startswith("::error::"), log)
+                for part in explained:
+                    self.assertIn(part, commands(log)[0])
+                # Compared without case: entries and two of the options are lowercased as they're read.
+                shown = (log + summary + outputs).casefold()
+                self.assertEqual([value for value in synthetic if value.casefold() in shown], [])
+                self.assertEqual((fake.connections, fake.requests, summary, outputs), ([], [], "", ""))
+
     def test_stop_the_step_before_anything_is_checked(self):
         cases = {
             "cert-days": {"domains": "example.com", "cert_days": "-5"},
@@ -527,7 +620,7 @@ class InvalidInputs(unittest.TestCase):
             "'domains' has entries that are not domain names": {"domains": "example.com\n*.example.com"},
             "No domains given": {"domains": "# all commented out"},
             # Checked as fass.example, it would report another domain's certificate and registration.
-            "two different domains: faß.example, λας.example. List each in its xn-- form.": {"domains": "example.com faß.example λας.example"},
+            "two different domains. List each in its xn-- form.": {"domains": "example.com faß.example λας.example"},
         }
         for named, inputs in cases.items():
             with self.subTest(named):
@@ -537,6 +630,8 @@ class InvalidInputs(unittest.TestCase):
                 self.assertEqual(len(commands(log)), 1)
                 self.assertTrue(commands(log)[0].startswith("::error::"))
                 self.assertIn(named, commands(log)[0])
+                # Named by its input, never by what was typed: every entry here is under example.
+                self.assertNotIn("example", commands(log)[0])
                 self.assertEqual((fake.connections, fake.requests, summary, outputs), ([], [], "", ""))
 
     def test_a_domain_entry_cannot_forge_a_workflow_command(self):
@@ -545,8 +640,49 @@ class InvalidInputs(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(len(commands(log)), 1)
         self.assertTrue(commands(log)[0].startswith("::error::'domains' has entries"))
-        # The entry is echoed (lowercased) with its % escaped, so GitHub can't decode it into a line break.
-        self.assertIn("%250a::notice::hi", commands(log)[0])
+        # The entries are never repeated, so no part of them reaches the log for GitHub to read as a command.
+        forged = ("::warning", "title=", "all clear", "nothing expires", "%0a", "%250a", "::notice")
+        self.assertEqual([part for part in forged if part in log.casefold()], [])
+
+    def test_a_malformed_host_is_refused_and_nothing_is_checked(self):
+        # Before, each could be dropped, or trimmed into a valid host it doesn't name, and the run went on.
+        entries = (
+            ".",
+            ".example.com",
+            "example.com..",
+            "[2001:db8::1",
+            "[2001:db8::1]]",
+            "[2001:db8::1]unexpected",
+            "[2001:db8::1]:",
+            "https://[2001:db8::1]unexpected/",
+            "https://[2001:db8::1]:x/",
+            "/",
+            "?q",
+            ":443",
+            "user@",
+            "[example.com]",
+            "[192.0.2.1]",
+            "https://[example.com]/",
+        )
+        # The same error for every entry: the input is named and the entry is never repeated.
+        refused = (
+            "::error::'domains' has entries that are not domain names or IP addresses. "
+            "List each as a domain name or IP address, on its own or as the host of a URL."
+        )
+        for entry in entries:
+            # Alone, and among good entries, which are never checked either.
+            for domains in (entry, f"example.com\n{entry}, 192.0.2.1"):
+                with self.subTest(domains=domains):
+                    fake = FakeNetwork({}, {})
+                    code, log, summary, outputs = run(fake, domains=domains)
+                    self.assertEqual(code, 2)
+                    self.assertEqual(commands(log), [refused])
+                    self.assertEqual((fake.connections, fake.requests, summary, outputs), ([], [], "", ""))
+        fake = FakeNetwork({}, {})
+        code, log, summary, outputs = run(fake, domains="\n".join(entries))
+        self.assertEqual(code, 2)
+        self.assertEqual(commands(log), [refused])
+        self.assertEqual((fake.connections, fake.requests, summary, outputs), ([], [], "", ""))
 
 
 class Script(unittest.TestCase):
@@ -556,7 +692,7 @@ class Script(unittest.TestCase):
         env = {"INPUT_DOMAINS": "example.com", "INPUT_CERT_DAYS": "-1"}
         result = subprocess.run([sys.executable, "-I", SCRIPT], env=env, capture_output=True, text=True, timeout=60)
         self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertEqual(result.stdout, "::error::'cert-days' must be 'auto' or a whole number of days, 0 or more, not '-1'.\n")
+        self.assertEqual(result.stdout, "::error::'cert-days' must be 'auto' or a whole number of days, 0 or more.\n")
         self.assertEqual(result.stderr, "")
 
 
