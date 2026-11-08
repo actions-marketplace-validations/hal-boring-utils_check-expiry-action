@@ -267,6 +267,12 @@ def days_left(when: datetime, now: datetime) -> float:
     return (when - now).total_seconds() / DAY
 
 
+def utc_timestamp(when: datetime) -> str:
+    """An aware time in UTC as ISO 8601 ending Z, such as 2027-08-13T04:00:00Z, with its microseconds
+    only when it has any, so a finding on its last day still gives the hour."""
+    return when.astimezone(timezone.utc).replace(tzinfo=None).isoformat() + "Z"
+
+
 def describe_days(days: float) -> str:
     whole = int(days // 1) if days >= 0 else -int(-days // 1)
     if days < 0:
@@ -278,7 +284,7 @@ def cert_finding(not_before: datetime, not_after: datetime, now: datetime, setti
     lifetime = (not_after - not_before).total_seconds() / DAY
     left = days_left(not_after, now)
     threshold = cert_warn_days(lifetime, setting)
-    text = f"expires {not_after:%Y-%m-%d} ({describe_days(left)}), {round(lifetime)}-day certificate{detail}"
+    text = f"expires {utc_timestamp(not_after)} ({describe_days(left)}), {round(lifetime)}-day certificate{detail}"
     if left < 0:
         return Finding(FAIL, text)
     if left < threshold:
@@ -290,7 +296,7 @@ def domain_finding(expires: datetime | None, now: datetime, warn_days: int) -> F
     if expires is None:
         return Finding(UNKNOWN, "no expiry published by the registry")
     left = days_left(expires, now)
-    text = f"expires {expires:%Y-%m-%d} ({describe_days(left)})"
+    text = f"expires {utc_timestamp(expires)} ({describe_days(left)})"
     if left < 0:
         return Finding(FAIL, text)
     if left < warn_days:

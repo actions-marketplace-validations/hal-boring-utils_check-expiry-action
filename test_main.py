@@ -524,15 +524,16 @@ class RegistryDates(unittest.TestCase):
         upper, lower, east, west = (NOW - timedelta(days=days) for days in (3.5, 2.5, 1.5, 4.5))
         dates = {
             "upper.example": upper.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "lower.example": lower.strftime("%Y-%m-%dt%H:%M:%S.%f789z"),
+            "lower.example": lower.strftime("%Y-%m-%dt%H:%M:%S.654321789z"),
             "east.example": east.astimezone(timezone(timedelta(hours=5, minutes=30))).strftime("%Y-%m-%dT%H:%M:%S+05:30"),
             "west.example": west.astimezone(timezone(timedelta(hours=-8))).strftime("%Y-%m-%dT%H:%M:%S-08:00"),
         }
+        # Each shown in UTC with the seconds the registry gave, and lower.example's fraction cut to microseconds.
         messages = {
-            "upper.example": f"expires {upper:%Y-%m-%d} (expired 3 days ago)",
-            "lower.example": f"expires {lower:%Y-%m-%d} (expired 2 days ago)",
-            "east.example": f"expires {east:%Y-%m-%d} (expired 1 day ago)",
-            "west.example": f"expires {west:%Y-%m-%d} (expired 4 days ago)",
+            "upper.example": f"expires {upper:%Y-%m-%dT%H:%M:%S}Z (expired 3 days ago)",
+            "lower.example": f"expires {lower:%Y-%m-%dT%H:%M:%S}.654321Z (expired 2 days ago)",
+            "east.example": f"expires {east:%Y-%m-%dT%H:%M:%S}Z (expired 1 day ago)",
+            "west.example": f"expires {west:%Y-%m-%dT%H:%M:%S}Z (expired 4 days ago)",
         }
         fake = FakeNetwork({host: HEALTHY for host in dates}, {rdap_url(host): dated(host, date) for host, date in dates.items()})
         for fail_on_warning in ("true", "false"):
@@ -545,6 +546,42 @@ class RegistryDates(unittest.TestCase):
                 self.assertTrue(all(cert.startswith("OK: expires ") for cert, _ in rows.values()), rows)
                 self.assertEqual({host: reg for host, (_, reg) in rows.items()}, {host: f"Failure: {message}" for host, message in messages.items()})
                 self.assertIn("4 failures, 0 warnings, 0 registration dates unknown.", summary)
+
+
+class ExpiryTimes(unittest.TestCase):
+    """A known expiry is shown as an ISO 8601 time in UTC, so a finding on its last day still gives
+    the hour, in the run log, the annotations and the job summary alike."""
+
+    def test_the_last_day_shows_the_utc_time_on_every_surface(self):
+        # SYNTHETIC: a 6-day certificate with 6 hours left, and a registration that ends in about 20
+        # hours, which its registry writes at +09:30 with a fraction finer than microseconds.
+        cert_expiry = NOW + timedelta(days=0.25)
+        reg_expiry = (NOW + timedelta(hours=20)).replace(microsecond=250000)
+        local = reg_expiry.astimezone(timezone(timedelta(hours=9, minutes=30)))
+        fake = FakeNetwork(
+            {"example.com": certificate(6, 0.25)},
+            {EXAMPLE_COM: dated("example.com", f"{local:%Y-%m-%dT%H:%M:%S}.250000999+09:30")},
+        )
+        code, log, summary, outputs = run(fake, domains="example.com")
+        cert_text = f"expires {cert_expiry:%Y-%m-%dT%H:%M:%S}Z (0 days left), 6-day certificate, TLS 1.3; warns under 0.75 days"
+        reg_text = f"expires {reg_expiry:%Y-%m-%dT%H:%M:%S}.250000Z (0 days left); warns under 30 days"
+        self.assertEqual(code, 1)
+        self.assertEqual(outputs, "warnings=2\nfailures=0\n")
+        self.assertEqual(
+            log.splitlines(),
+            [
+                "example.com",
+                f"  certificate: Warning: {cert_text}",
+                f"  registration: Warning: {reg_text}",
+                f"::warning title=Certificate example.com::{cert_text}",
+                f"::warning title=Domain example.com::{reg_text}",
+                "",
+                "0 failures, 2 warnings, 0 registration dates unknown.",
+            ],
+        )
+        self.assertEqual(table(summary), {"example.com": (f"Warning: {cert_text}", f"Warning: {reg_text}")})
+        self.assertEqual(fake.connections, [("example.com", 443)])
+        self.assertEqual(fake.requests, [ce.BOOTSTRAP_URL, EXAMPLE_COM])
 
 
 class IpAddresses(unittest.TestCase):
