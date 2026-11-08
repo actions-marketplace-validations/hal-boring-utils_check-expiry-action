@@ -60,6 +60,48 @@ class Thresholds(unittest.TestCase):
         self.assertEqual(ce.domain_finding(NOW - timedelta(days=1), NOW, 0).level, ce.FAIL)
 
 
+class ExpiryTimes(unittest.TestCase):
+    """A finding gives the known expiry as an ISO 8601 time in UTC, ending Z, so on the last day it
+    still shows the hour."""
+
+    def test_a_certificate_on_its_last_day_shows_the_time_it_expires(self):
+        not_after = datetime(2027, 3, 1, 7, 30, 15, tzinfo=timezone.utc)
+        finding = ce.cert_finding(not_after - timedelta(days=6), not_after, NOW, "auto", ", TLS 1.3")
+        self.assertEqual(finding.level, ce.WARN)
+        self.assertEqual(finding.summary, "expires 2027-03-01T07:30:15Z (0 days left), 6-day certificate, TLS 1.3; warns under 0.75 days")
+
+    def test_a_registration_on_its_last_day_shows_the_time_it_expires(self):
+        finding = ce.domain_finding(datetime(2027, 3, 1, 23, 59, 59, tzinfo=timezone.utc), NOW, 30)
+        self.assertEqual(finding.level, ce.WARN)
+        self.assertEqual(finding.summary, "expires 2027-03-01T23:59:59Z (0 days left); warns under 30 days")
+
+    def test_an_expiry_given_with_an_offset_is_shown_in_utc(self):
+        # SYNTHETIC registry dates west and east of UTC: 22:00 at -08:00 on February 28 is 06:00 UTC on March 1.
+        cases = {
+            "2027-02-28T22:00:00-08:00": "expires 2027-03-01T06:00:00Z (0 days left); warns under 30 days",
+            "2027-03-01T15:45:30+05:30": "expires 2027-03-01T10:15:30Z (0 days left); warns under 30 days",
+        }
+        for text, summary in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(ce.domain_finding(ce.parse_rdap_date(text), NOW, 30).summary, summary)
+        # A time in another zone is converted to UTC, never labelled Z as it stands.
+        not_after = datetime(2027, 3, 1, 15, 45, 30, tzinfo=timezone(timedelta(hours=5, minutes=30)))
+        finding = ce.cert_finding(not_after - timedelta(days=6), not_after, NOW, "auto")
+        self.assertEqual(finding.summary, "expires 2027-03-01T10:15:30Z (0 days left), 6-day certificate; warns under 0.75 days")
+
+    def test_a_fraction_of_a_second_is_kept_to_the_microsecond(self):
+        cases = {
+            "2027-08-13T04:00:00Z": "2027-08-13T04:00:00Z",
+            "2027-08-13T04:00:00.5Z": "2027-08-13T04:00:00.500000Z",
+            # Cut to microseconds as it is read, never rounded up.
+            "2027-08-13T04:00:00.123456789Z": "2027-08-13T04:00:00.123456Z",
+            "2027-08-13t09:30:00.000001+05:30": "2027-08-13T04:00:00.000001Z",
+        }
+        for text, shown in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(ce.domain_finding(ce.parse_rdap_date(text), NOW, 30).summary, f"expires {shown} (165 days left)")
+
+
 class ExactName(unittest.TestCase):
     """A registry answer counts only when it is the domain record of exactly the host looked up."""
 
